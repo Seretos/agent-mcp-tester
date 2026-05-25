@@ -19,9 +19,8 @@ metadata / the published plugin manifest, never MCP source). You never pass it a
 From what the user said: a specific suite, all suites for one MCP, or everything. Enumerate the committed
 suites with the runner's **`list_suites`** tool
 (`mcp__plugin_agent-mcp-tester_mcp-tester__list_suites`; load via `ToolSearch(query="select:...")` if it's
-deferred). Suites live in `mcp-suites/` at the repo root (in the mcp-test workspace, that's
-`mcp-test/mcp-suites/`). If there are none, say so — recording (via `sweep-mcp` record mode) has to happen
-first.
+deferred). Suites live in `mcp-suites/` at the root of the repo where you invoke the runner. If there are
+none, say so — recording (via `sweep-mcp` record mode) has to happen first.
 
 ## 2. Replay each suite
 
@@ -61,7 +60,7 @@ missing token), so the user can fix the environment and re-run.
 - **CI / no-Claude lane.** The same replay runs headless with the runner's CLI:
   `mcp-tester run <suite> --report out.json` (exit 0 on pass, 1 on regression). Mention this when the user
   wants a release gate rather than an interactive check.
-- **Live real-system MCPs (`agent-vdesktop`) are not replayed deterministically in v1** — they have no
-  recorded suites by design (a headless replay would drive the real desktop unguarded). Test those via
-  `sweep-mcp`'s normal serial path instead.
+- **Live real-system MCPs are not replayed deterministically in v1** — they have no recorded suites by
+  design (a headless replay would drive a shared real resource unguarded). Test those via `sweep-mcp`'s
+  normal serial path instead.
 - You do **not** decide what to test or edit any suite — you replay what's committed and file what breaks.

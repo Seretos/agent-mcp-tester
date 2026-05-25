@@ -1,40 +1,50 @@
 ---
 name: file-findings
-description: File a set of E2E test findings as tickets in the correct Seretos repos. Use after a black-box MCP test run, when you have findings to record. Routes each finding to the right repo by the wrapper/lib split (behaviour → lib repo, tool surface → wrapper repo, ambiguous → wrapper), groups findings thematically by root cause, labels them (bug / documentation / enhancement + severity + e2e-test), and creates the tickets autonomously via the project-issues MCP. Does NOT decide what to test — it only files findings handed to it.
+description: File a set of E2E test findings as issue-tracker tickets, autonomously. Use after a black-box MCP test run, when you have findings to record. Routes each finding to the right repo by the wrapper/lib split (behaviour → lib repo, tool surface → wrapper repo, ambiguous → wrapper), groups findings thematically by root cause, labels them (bug / documentation / enhancement + severity + e2e-test), and creates the tickets via whatever issue-tracker MCP is available. If no tracker is reachable or a finding's target project can't be resolved, it falls back to printing the findings directly instead of failing. Does NOT decide what to test — it only files findings handed to it.
 ---
 
 # file-findings
 
-You take a set of test findings and file them as tickets in the correct repos, autonomously.
-You do **not** decide what gets tested or re-test anything — you work the findings you were given.
+You take a set of test findings and record them — as issue-tracker tickets when you can, or
+printed directly when you can't. You do **not** decide what gets tested or re-test anything; you
+work the findings you were given.
 
-The findings may come from an LLM sweep (`sweep-mcp`) or from a deterministic replay (`replay-suite`):
-both hand you the same finding shape — a tool, observed-vs-expected, a repro call, a severity, and a
-`behaviour`/`tool-surface` routing hint. Treat them identically.
+The findings may come from an LLM sweep (`sweep-mcp`) or from a deterministic replay
+(`replay-suite`): both hand you the same finding shape — a tool, observed-vs-expected, a repro
+call, a severity, and a `behaviour`/`tool-surface` routing hint. Treat them identically.
+
+## 0. The ticket connection is soft — decide whether you can file at all
+
+Filing is best-effort, not a hard dependency. Before routing anything, establish whether you can
+actually create tickets:
+
+- **No issue-tracker MCP reachable** — there are no project/ticket tools, or they won't load even
+  via `ToolSearch`. Then **do not fail**: skip to §5 and print the findings as a clean report so the
+  caller still gets them.
+- **A tracker is reachable.** Enumerate the projects it exposes (e.g. `list_projects` /
+  `find_projects`). That live list — plus any wrapper↔lib mapping in the **host repo's testing
+  notes** — is your routing ground truth. This plugin ships no hardcoded repo list on purpose.
+
+Any individual finding whose target you can't resolve (no matching registered project, or the
+project lacks create-issue permission) is **not** an error either: keep it in the report (§5) and
+say why it wasn't filed. File what you can; print what you can't.
 
 ## 1. Route each finding to the right repo
 
-The plugins under test are thin **MCP wrappers** over a **lib engine**, or **self-contained**.
+Plugins under test are typically thin **MCP wrappers** over a **lib engine**, or **self-contained**.
 Route by where the cause lives:
 
-- **Wrapper over a lib** → behaviour / logic / API talk / return shapes / error contract / pagination /
-  atomicity / provider quirks / data model goes to the **lib repo**. Tool surface — tool schema, param
-  definitions, required/optional flags, enum docs, docstring-vs-behaviour, naming, discoverability —
-  goes to the **wrapper repo**.
+- **Wrapper over a lib** → behaviour / logic / API semantics / return shapes / error contract /
+  pagination / atomicity / provider quirks / data model go to the **lib repo**. Tool surface — tool
+  schema, param definitions, required/optional flags, enum docs, docstring-vs-behaviour, naming,
+  discoverability — goes to the **wrapper repo**.
 - **Self-contained plugin** (no lib) → everything goes to the plugin's own repo.
 - **Ambiguous or mixed** → the **wrapper repo wins**.
 
-Known pairs (extend as the ecosystem grows):
-
-| Wrapper MCP | Lib engine | Behaviour/logic → | Tool surface/UX → |
-|---|---|---|---|
-| `agent-project-issues` | `lib-python-projects` | `lib-python-projects` | `agent-project-issues` |
-| `agent-vdesktop` | `lib-python-vdesktop` | `lib-python-vdesktop` | `agent-vdesktop` |
-
-`lib-python-config` is not a separate target — config findings route via the `lib-python-projects` rule.
-
-If a finding's target repo isn't registered (`list_projects` / `find_projects` doesn't show it, or it
-lacks `issues.create`), do not force it — keep that finding in your report and say so.
+Which concrete repo is the wrapper and which is the lib for a given MCP is **not** baked into this
+skill — read it from the host repo's testing notes / the registered project list (§0). If you have
+no mapping for a finding's MCP, route it to the project that matches the MCP's own name if one is
+registered, else keep it for direct output.
 
 ## 2. Group findings thematically by root cause
 
@@ -51,20 +61,23 @@ Each finding inside a ticket body carries a **concrete repro call** (the exact t
 - **Type** — functional defect → `bug`; agent-intuitiveness / UX / docstring / discoverability finding →
   `documentation` (clarity/description issues) or `enhancement` (missing capability / ergonomic API gap).
 - **Severity** — exactly one of `severity:high`, `severity:med`, `severity:low`:
-  - `severity:high` — crash, data loss, silent wrong result, or the ticket's claimed behaviour outright fails.
+  - `severity:high` — crash, data loss, silent wrong result, or the claimed behaviour outright fails.
   - `severity:med` — wrong behaviour with a workaround, a notable inconsistency, or UX friction that would
     mislead a real agent.
   - `severity:low` — cosmetic, docstring nit, minor polish.
 - **Origin** — always `e2e-test`.
 
-Do **not** add `ai-generated` yourself — the MCP server adds it automatically.
+If the tracker stamps an AI-attribution marker (e.g. `ai-generated`) automatically, don't add it
+yourself.
 
 ## 4. Create the tickets
 
-Use `create_ticket` on the project-issues MCP, **one at a time, sequentially** — parallel create bursts
-fail silently. For each: the resolved `project_id`, a clear title, the grouped body, and the labels above.
+Use the issue-tracker MCP's create-ticket tool, **one at a time, sequentially** — parallel create
+bursts can fail silently. For each: the resolved target project, a clear title, the grouped body,
+and the labels above.
 
 ## 5. Report
 
-When done, list every ticket you created: target repo, title, label set, and URL. For any finding you
-could **not** file (no registered target), say which and why.
+When done, list every ticket you created: target repo, title, label set, and URL. Then list every
+finding you could **not** file — no reachable tracker, or no resolvable target — with the finding's
+repro, observed-vs-expected, severity, and routing hint inline, so nothing is lost.

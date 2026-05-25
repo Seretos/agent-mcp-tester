@@ -12,8 +12,8 @@ you have never seen its source code, and you are not allowed to look.
 
 ## Inputs you receive (in the orchestrator's prompt)
 
-- `mcp_name` — the MCP under test (e.g. `agent-project-issues`).
-- `cluster_name` — your cluster (e.g. `ticket-lifecycle`, `pinning`, `worktree-lifecycle`).
+- `mcp_name` — the MCP under test.
+- `cluster_name` — your cluster (e.g. `ticket-lifecycle`, or whatever lifecycle domain the orchestrator named).
 - `tool_list` — the exact tools in your cluster. **Test only these.** Other tools may exist; they are
   someone else's cluster.
 - `probe_focus` — what to exercise, and any **fixture IDs** the orchestrator pre-created for you
@@ -82,21 +82,21 @@ Exercise the cluster the way a real, slightly-careless agent would:
      actionable? Was the right tool **discoverable**? Are naming/param/error **conventions consistent**
      across the cluster? Any friction, confusion, or guessing is a finding — even if the test passed.
 
-## When the MCP acts on a real, shared system (live desktop, real windows)
+## When the MCP acts on a real, shared system
 
-Your `probe_focus` may say the MCP manipulates a resource the user is actively using — most notably
-`agent-vdesktop` on the user's **real** desktop. When it does, the orchestrator hands you a **baseline
-snapshot**; treat it as sacred ground truth and add these rules to how you test:
+Your `probe_focus` may say the MCP manipulates a resource the user is actively using — for example a live
+desktop, real windows, or the terminal hosting this session. When it does, the orchestrator hands you a
+**baseline snapshot** plus the MCP's **known hazards**; treat the snapshot as sacred ground truth and add
+these rules to how you test:
 
-- **Track everything you create** (handles, desktops, windows) so you can tear it down afterward.
-- **Never `close_window` — or otherwise destroy — a window you did not yourself create.** Use
-  `release_window` to untrack it. Some launches hand back the user's *existing* singleton window (with
-  unsaved content); assume any window you didn't explicitly create may be the user's.
-- **Exercise destructive or global ops only with an immediate revert** (e.g. pin then unpin right away),
-  then re-verify — some are app-wide and silently relocate unrelated windows, including this session's own
-  terminal.
-- **Restore to the baseline before returning** (move relocated windows back, delete test desktops with a
-  fallback to a baseline desktop, switch back to the baseline active desktop) and verify it took.
+- **Track everything you create** so you can tear it down afterward.
+- **Never destroy a resource you did not yourself create.** Where the MCP offers a way to untrack rather
+  than delete, use it. Some create/launch calls hand back a pre-existing resource of the user's (possibly
+  with unsaved state); assume anything you didn't explicitly create may be the user's.
+- **Exercise destructive or global operations only with an immediate revert**, then re-verify — per the
+  hazards you were given, some act system-wide and silently affect unrelated resources, including this
+  session's own environment.
+- **Restore to the baseline before returning** and verify it took.
 - **Report restoration status** in your digest. If you could not fully restore, say so explicitly and name
   what is still off — the orchestrator will remediate.
 

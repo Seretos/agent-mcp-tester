@@ -1,104 +1,33 @@
 # agent-mcp-tester
 
-MCP server that ships as a self-contained binary (PyInstaller-frozen Python). End users don't need a Python toolchain.
+E2E-tests other MCP servers. Two phases: an **LLM sweep** that can *record* repeatable suites, and a **deterministic runner** that *replays* them over raw MCP stdio with zero LLM. PyInstaller-frozen Python, shipped as a self-contained binary (`bin/mcp-tester` on Linux, `bin/mcp-tester.exe` on Windows).
 
-## Layout
+## Why this plugin ships an MCP server (not just a CLI)
 
-```
-src/mcp_tester_plugin/          # Python source (src-layout)
-  server.py                       # FastMCP entry point, wires the tools
-  __main__.py                     # python -m / PyInstaller entry
+The binary is the deterministic runner. It is **dual-mode**: no args → FastMCP stdio server; a subcommand (`run` / `list` / `validate` / `save` / `serve`) → a plain CLI for CI. Both surfaces call the same core in `runner` / `suites`.
 
-tests/                          # pytest, runs on every push (test.yml matrix: windows-latest + ubuntu-22.04)
-scripts/build.ps1               # cross-platform pwsh: PyInstaller wrapper + smoke test + staging
-mcp-tester.spec               # PyInstaller config (output extension picked by host OS)
-pyproject.toml                  # setuptools (package-dir = src/) + pytest config
-.claude-plugin/plugin.json      # Claude manifest; extensionless bin/mcp-tester via ${CLAUDE_PLUGIN_ROOT}
-.codex-plugin/plugin.json       # Codex manifest; same surface, command via ${PLUGIN_ROOT}
-SECURITY.md                     # threat model — extend per tool surface
+The MCP server is **load-bearing**, not template residue: a skill's `Bash` environment does **not** receive `${CLAUDE_PLUGIN_ROOT}` (it's exported only to MCP-server and hook subprocesses; skills get only `${CLAUDE_SKILL_DIR}`, from which reaching `bin/` is a fragile `../../` hack — anthropics/claude-code#48230). So the in-harness skills have no reliable way to locate and run the binary themselves. The MCP tools (`run_suite`, `list_suites`, `validate_suite`, `save_suite`) are that bridge — the host launches the server with the right path and env. **CLI lane = CI / headless; MCP lane = in-harness skills.** Same engine behind both.
 
-.github/workflows/
-  test.yml                      # pytest matrix on every push and PR
-  release.yml                   # manual-dispatch multi-OS release (stamp -> matrix-build -> assemble)
-  dispatch.yml                  # manual recovery: re-send marketplace dispatch
-```
+## Design contracts an agent won't infer from the source
 
-## OS_TARGETS
+- **Source-free target resolution.** The runner spawns the MCP-under-test by reading only *public* launch metadata — a `--server` override, `mcp-suites/targets.yaml`, the local marketplace manifest, or the installed-plugins cache (`resolve.py`'s 4-tier chain). It never reads the target MCP's source, and neither do the LLM agents. Keep it that way: the test engines treat every target as a black box.
+- **Suites live in the host repo, not here.** The runner reads/writes `<host-repo-root>/mcp-suites/` (in practice the `mcp-test` workspace), deliberately separate from both this plugin and each target MCP's repo. Suites are authored once (LLM record) and replayed forever (zero LLM).
+- **The skills + agent are project-agnostic.** `skills/{sweep-mcp,replay-suite,file-findings}` and `agents/cluster-tester` carry no target-specific knowledge (which MCPs exist, wrapper↔lib pairings, per-MCP hazards, sandbox projects). That all lives in the **host repo's `AGENTS.md`** and the suites/targets the user supplies. Don't bake ecosystem specifics back into these assets.
+- **Frozen-spawns-frozen env scrub.** The runner (a one-file PyInstaller binary) spawns *other* one-file PyInstaller binaries. `runner._child_env()` must strip `_MEIPASS2` / `_PYI_*` and reset `LD_LIBRARY_PATH`, or the child's bootloader mis-resolves its libs. This is the highest-risk runtime path — keep it covered by the cross-binary integration test.
 
-Default: `[windows, linux]`. The pipeline produces native binaries for both platforms and ships them inside a single release zip.
+## Contracts an agent won't infer from the tree
 
-- Both manifests use an extensionless `command` of `bin/mcp-tester` — `${CLAUDE_PLUGIN_ROOT}/bin/mcp-tester` in `.claude-plugin`, `${PLUGIN_ROOT}/bin/mcp-tester` in `.codex-plugin`. On Windows the host resolves that to `mcp-tester.exe`; on Linux to `mcp-tester`. One zip serves both platforms and both hosts.
-- `release.yml` is a three-stage pipeline:
-  1. **stamp** (Linux) — writes the version into `pyproject.toml` + both plugin manifests (`.claude-plugin/plugin.json` and `.codex-plugin/plugin.json`) and uploads them as an artifact so every downstream job pulls the same stamped sources.
-  2. **build** (matrix `windows-latest` + `ubuntu-22.04`) — each runner calls `scripts/build.ps1 -Clean -Package` and uploads its `bin/` payload as `bin-<os>`.
-  3. **assemble** (Linux) — merges the per-OS bins into a single `build/stage/agent-mcp-tester/bin/` tree, builds the release zip with correct Unix mode bits via Python's `zipfile`, force-pushes the orphan `release` branch, creates the GitHub Release, and dispatches to the marketplace.
+- **Release is orphan-branch + marketplace dispatch.** `release.yml` (manual: Actions → release → `version=X.Y.Z`) stamps the version, matrix-builds per OS, then force-pushes an orphan `release` branch holding only install-ready files and POSTs a dispatch to `Seretos/agent-marketplace`. `main` and `release` share no history — never merge between them. Clients install at the tag `agent-mcp-tester--vX.Y.Z`.
+- **Version is pipeline-owned.** The `version` in `pyproject.toml` and both manifests is a placeholder; the workflow input is the source of truth and the stamp never lands on `main`. Don't hand-bump it.
+- **Two host manifests, no `.mcp.json`.** `.claude-plugin/plugin.json` resolves `command` via `${CLAUDE_PLUGIN_ROOT}`, `.codex-plugin/plugin.json` via `${PLUGIN_ROOT}`; both carry an inline `mcpServers` block. Keep them in sync.
+- **Required secret:** `MARKETPLACE_DISPATCH_TOKEN` — fine-grained PAT, `Contents: RW` + `Pull requests: RW` on `Seretos/agent-marketplace` only.
 
-### Windows-only override
+## Gotchas (the "why" behind the code)
 
-If this plugin is genuinely Win32-bound (e.g. depends on `pyvda`, `pywin32`, `comtypes` for COM, like agent-vdesktop), reduce `OS_TARGETS` to `[windows]`:
+- **`build.ps1` runs under Windows PowerShell 5.1, PS7, and Linux `pwsh`.** It derives `$IsWindows` from `$env:OS` (5.1 lacks the auto variable) and sets no global `$ErrorActionPreference='Stop'` (PyInstaller floods stderr, which 5.1 wraps as ErrorRecords). The smoke step gates the build on a real MCP `initialize` handshake.
+- **`mcp-tester.spec` hidden imports.** The runner is itself an MCP *client* and parses YAML suites, so the spec lists `mcp.client.*`, `yaml`, and `jsonpath_ng` in `extra_hidden` — PyInstaller won't find these from static analysis of a client that imports them lazily.
+- **`_resolve_exe` prefers `.exe` on Windows.** A dev `bin/` can hold both the extensionless Linux ELF and the `.exe`; on Windows the ELF would `exists()` first and fail to run as a Win32 image, so resolution explicitly prefers the `.exe`.
 
-1. In `.github/workflows/release.yml`:
-   - Remove the `ubuntu-22.04` row from the `build` job's `matrix.include`.
-   - In the assembly job's "Build merged staging tree" step, drop the `bin/mcp-tester` (Linux binary) assertion and the `chmod +x` on it.
-   - In "Push orphan release branch", drop `bin/mcp-tester` from the `git add` / `git update-index --chmod=+x` calls.
-2. In `.github/workflows/test.yml`: drop `ubuntu-22.04` from the `matrix.os` list.
-3. Append `.exe` to the `command` in **both** manifests: `.claude-plugin/plugin.json` → `${CLAUDE_PLUGIN_ROOT}/bin/mcp-tester.exe`, `.codex-plugin/plugin.json` → `${PLUGIN_ROOT}/bin/mcp-tester.exe`.
+## OS targets
 
-The multi-OS shape is the default because most MCP servers are I/O- and HTTP-bound and have no native-Windows dependency. Windows-only is the deliberate exception, not the rule.
-
-## Branches
-
-- `main` — source of truth. All edits go here.
-- `release` — orphan branch, force-pushed by `release.yml`. Contains only install-ready files: `.claude-plugin/plugin.json`, `.codex-plugin/plugin.json`, `bin/mcp-tester.exe`, `bin/mcp-tester`, `skills/`, `agents/`, `README.md`. Clients clone at the version tag (e.g. `agent-mcp-tester--v0.0.1`).
-
-The release branch shares no history with main. Don't try to merge between them.
-
-## Release flow
-
-Triggered manually:
-
-```
-Actions → release → Run workflow → version=X.Y.Z
-```
-
-or `gh workflow run release.yml -f version=X.Y.Z`.
-
-The workflow:
-1. Validates `X.Y.Z` is semver.
-2. Fails if tag `agent-mcp-tester--vX.Y.Z` already exists.
-3. Stamps the version into `pyproject.toml` and `.claude-plugin/plugin.json` (CI checkout only — never pushed back to main).
-4. Builds binaries on each OS in the matrix and uploads them as `bin-<os>` artifacts.
-5. Assembly job merges every per-OS payload, packs the release zip with Unix-mode bits, force-pushes the orphan `release` branch, creates the GitHub Release with the zip attached, and POSTs to `Seretos/agent-marketplace/dispatches` with the plugin metadata (using `MARKETPLACE_DISPATCH_TOKEN`).
-
-`pyproject.toml`'s `version` field is **not** load-bearing for releases. The workflow input drives everything.
-
-## Required secret
-
-- `MARKETPLACE_DISPATCH_TOKEN` — fine-grained PAT with `Contents: Read and write` + `Pull requests: Read and write` on `Seretos/agent-marketplace` only.
-
-## Build conventions (`scripts/build.ps1`)
-
-- Cross-platform: runs under **Windows PowerShell 5.1**, PowerShell 7 on Windows, AND `pwsh` on Linux. PS 5.1 lacks the auto `$IsWindows` variable so the script derives it from `$env:OS`.
-- Output filename: `bin/mcp-tester.exe` on Windows, `bin/mcp-tester` on Linux (no extension). The Linux binary is explicitly `chmod +x`ed after copy.
-- No global `$ErrorActionPreference = 'Stop'` — PyInstaller writes heavily to stderr, which PS 5.1 wraps as ErrorRecord and would trip a global Stop.
-- Python discovery: prefers `py.exe -3` on Windows locally, falls back to `python` / `python3` (which is what `actions/setup-python` installs).
-- The smoke test runs an MCP `initialize` handshake against the freshly built binary. The build fails if the handshake fails.
-- `-Package` stages `build/stage/agent-mcp-tester/` with this OS's binary only — `release.yml`'s assembly job merges the per-OS stages into the final zip.
-
-## What this plugin ships beyond the binary
-
-Unlike a plain MCP plugin, `agent-mcp-tester` also ships `skills/` and `agents/`:
-
-- `skills/sweep-mcp` — orchestrates an LLM-driven full-surface sweep; in record mode persists repeatable suites.
-- `skills/replay-suite` — deterministically replays committed suites via the runner (zero LLM).
-- `skills/file-findings` — files findings/regressions as tickets via the project-issues MCP.
-- `agents/cluster-tester` — black-box per-cluster prober spawned by `sweep-mcp`.
-
-The MCP server (the binary) is the **deterministic runner** behind `replay-suite`: it spawns target MCP servers over stdio JSON-RPC and replays recorded suites. See the runner module docstrings under `src/mcp_tester_plugin/`.
-
-## PyInstaller / src-layout notes
-
-- The Python package is `mcp_tester_plugin` under `src/`. `pyproject.toml` declares `package-dir = { "" = "src" }` and `[tool.pytest.ini_options] pythonpath = ["src"]`.
-- `mcp-tester.spec` references `src/mcp_tester_plugin/__main__.py` as the entry and `pathex=[ROOT / "src"]`. Adjust both if the layout ever moves.
-- The runner is itself an MCP **client** (`mcp.client.stdio`) and parses YAML suites; `mcp-tester.spec` lists `mcp.client.*`, `yaml`, and `jsonpath_ng` in `extra_hidden`.
-- It spawns other PyInstaller one-file binaries (the target servers); the spawn helper scrubs `_MEIPASS2` / `_PYI_*` / `LD_LIBRARY_PATH` from the child env so the child's bootloader resolves its own libs.
+Multi-OS (`[windows, linux]`) — the runner is OS-generic and meant to run in Linux CI too. No Win32 bindings, so don't flip to Windows-only.
