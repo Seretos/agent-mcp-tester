@@ -225,14 +225,19 @@ def _expand_plugin_root(value: str, plugin_dir: Path) -> str:
 
 
 def _resolve_exe(command: str) -> str:
-    """On Windows, append ``.exe`` when the extensionless path is missing."""
+    """Pick the right binary for the host OS.
+
+    On Windows a dev ``bin/`` often holds BOTH the extensionless Linux binary
+    and the ``.exe``; prefer the ``.exe`` even when the extensionless file also
+    exists (it's the Linux ELF and would fail to run as a Win32 image).
+    """
     p = Path(command)
-    if p.exists():
-        return str(p)
     if os.name == "nt" and p.suffix == "":
         exe = p.with_suffix(".exe")
         if exe.exists():
             return str(exe)
+    if p.exists():
+        return str(p)
     return command
 
 
