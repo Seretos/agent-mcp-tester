@@ -1,0 +1,12 @@
+{
+  "name": "agent-mcp-tester",
+  "description": "E2E-tests MCP servers: LLM-driven sweeps that record repeatable test suites, plus a deterministic runner that replays them with zero LLM tokens.",
+  "version": "0.0.0",
+  "author": { "name": "Arne von Appen" },
+  "mcpServers": {
+    "mcp-tester": {
+      "command": "${CLAUDE_PLUGIN_ROOT}/bin/mcp-tester",
+      "args": []
+    }
+  }
+}
