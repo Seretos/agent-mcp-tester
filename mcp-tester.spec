@@ -31,8 +31,16 @@ extra_hidden = [
     "pydantic",
     "pydantic_core",
     "starlette",
+    # The runner is itself an MCP *client* and parses YAML suites — these are
+    # imported dynamically, so list them explicitly for PyInstaller.
+    "mcp.client.stdio",
+    "mcp.client.session",
+    "yaml",
+    "jsonpath_ng",
+    "jsonpath_ng.ext",
 ]
 extra_hidden += collect_submodules("mcp_tester_plugin")
+extra_hidden += collect_submodules("jsonpath_ng")
 
 a = Analysis(
     ["src/mcp_tester_plugin/__main__.py"],

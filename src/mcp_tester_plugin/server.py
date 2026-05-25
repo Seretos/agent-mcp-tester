@@ -1,3 +1,19 @@
+"""Dual-mode entry point for agent-mcp-tester.
+
+* **No args** -> runs as a FastMCP stdio server (what Claude Code launches).
+  Exposes the deterministic runner as tools the in-harness skills call.
+* **A subcommand** (`run`, `list`, `validate`, `save`, `serve`) -> a plain CLI
+  usable in CI with zero Claude.
+
+Both surfaces call the same shared core in ``runner`` / ``suites``.
+"""
+
+from __future__ import annotations
+
+import argparse
+import sys
+from typing import Any
+
 from mcp.server.fastmcp import FastMCP
 
 mcp = FastMCP("mcp-tester")
@@ -5,9 +21,97 @@ mcp = FastMCP("mcp-tester")
 
 @mcp.tool()
 def ping() -> str:
-    """Health check tool. Replace with real tools as you build them out."""
+    """Health check tool. Returns 'pong' if the server is alive."""
     return "pong"
 
 
+@mcp.tool()
+def run_suite(suite: str, policy: str = "continue") -> dict:
+    """Replay a recorded suite deterministically over raw MCP stdio (zero LLM).
+
+    `suite` is a suite name or path under mcp-suites/. `policy` is "continue"
+    (run all steps, collect every regression) or "abort" (stop at first failure).
+    Returns a structured report whose `regressions` feed the file-findings skill.
+    """
+    from . import runner
+
+    return runner.run(suite, policy=policy)
+
+
+@mcp.tool()
+def list_suites() -> list:
+    """List the committed suites under mcp-suites/ (name, targets, step count)."""
+    from . import suites
+
+    return suites.list_all()
+
+
+@mcp.tool()
+def validate_suite(suite: str, verify_replay: bool = True) -> dict:
+    """Schema-validate a suite; if verify_replay, also replay it once to confirm
+    its assertions hold against the live MCP."""
+    from . import runner
+
+    return runner.validate_suite(suite, verify_replay=verify_replay)
+
+
+@mcp.tool()
+def save_suite(suite_yaml: str, verify_replay: bool = True, filename: str = "") -> dict:
+    """Persist a recorded suite (YAML text) into mcp-suites/.
+
+    With verify_replay on (default), the suite is replayed once before being
+    written; if the replay does not pass, the suite is NOT saved and the failing
+    assertions are returned so a mis-marked volatile field can be downgraded.
+    """
+    from . import runner
+
+    return runner.save_suite(
+        suite_yaml, verify_replay=verify_replay, filename=filename or None
+    )
+
+
+def _build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        prog="mcp-tester",
+        description="Deterministic MCP suite runner (and FastMCP server when run with no args).",
+    )
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    pr = sub.add_parser("run", help="replay a suite deterministically")
+    pr.add_argument("suite", help="suite name or path under mcp-suites/")
+    pr.add_argument("--policy", choices=["continue", "abort"], default="continue")
+    pr.add_argument("--server", action="append", default=[],
+                    help="override a server: name=command (repeatable)")
+    pr.add_argument("--report", default=None, help="write the JSON report to this path")
+    pr.add_argument("--json", action="store_true", help="print the full JSON report")
+
+    sub.add_parser("list", help="list committed suites")
+
+    pv = sub.add_parser("validate", help="schema-validate (and optionally replay) a suite")
+    pv.add_argument("suite")
+    pv.add_argument("--no-replay", action="store_true", help="skip verify-replay")
+    pv.add_argument("--server", action="append", default=[])
+
+    psave = sub.add_parser("save", help="persist a recorded suite from a YAML file")
+    psave.add_argument("file", help="path to a suite YAML to validate, verify, and save")
+    psave.add_argument("--no-replay", action="store_true")
+    psave.add_argument("--server", action="append", default=[])
+
+    sub.add_parser("serve", help="run as the FastMCP stdio server (same as no args)")
+    return p
+
+
 def main() -> None:
-    mcp.run()
+    # No subcommand -> behave exactly like the template: run as an MCP server.
+    if len(sys.argv) == 1:
+        mcp.run()
+        return
+
+    args = _build_parser().parse_args()
+    if args.cmd == "serve":
+        mcp.run()
+        return
+
+    from . import runner
+
+    sys.exit(runner.cli_dispatch(args))
