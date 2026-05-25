@@ -10,6 +10,7 @@
       "args": []
     }
   },
+  "skills": "./skills",
   "interface": {
     "displayName": "Agent MCP Tester",
     "shortDescription": "E2E-tests MCP servers: LLM-driven sweeps that record repeatable test suites, plus a deterministic runner that replays them with zero LLM tokens."
