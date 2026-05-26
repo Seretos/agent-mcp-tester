@@ -364,3 +364,124 @@ async def test_save_suite_async_replay_passes(monkeypatch, tmp_path):
     assert result["saved"] is True
     assert "path" in result
     assert Path(result["path"]).is_file()
+
+
+# --------------------------------------------------------------------------
+# validate_suite_async: inline-YAML input path (regression + edge cases)
+# --------------------------------------------------------------------------
+MINIMAL_SUITE_YAML = yaml.safe_dump(MINIMAL_SUITE_DOC, sort_keys=False)
+
+
+@pytest.mark.anyio
+async def test_validate_suite_async_inline_yaml_no_replay(monkeypatch, tmp_path):
+    """Regression test: passing raw YAML text must succeed (was: SuiteError no suite matching).
+
+    Uses a tmp_path with NO mcp-suites/ dir so the file-path branch cannot resolve,
+    forcing the inline-YAML branch. Asserts valid=True, inline=True, no suite_file,
+    and _replay is never called.
+    """
+    replay_called = []
+
+    async def stub_replay(*_args, **_kwargs) -> dict[str, Any]:
+        replay_called.append(True)
+        return dict(STUB_PASS_REPORT)
+
+    monkeypatch.setattr(runner, "_replay", stub_replay)
+    monkeypatch.setenv("MCP_TESTER_ROOT", str(tmp_path))
+    # Deliberately do NOT create mcp-suites/ so resolve_suite_path raises SuiteError.
+
+    result = await runner.validate_suite_async(MINIMAL_SUITE_YAML, verify_replay=False)
+
+    assert result["valid"] is True
+    assert result.get("inline") is True
+    assert "suite_file" not in result
+    assert replay_called == [], "_replay must not be called when verify_replay=False"
+
+
+@pytest.mark.anyio
+async def test_validate_suite_async_inline_yaml_with_replay(monkeypatch, tmp_path):
+    """Inline-YAML path with verify_replay=True calls _replay and reflects result."""
+    replay_calls = []
+
+    async def stub_replay(*_args, **_kwargs) -> dict[str, Any]:
+        replay_calls.append(True)
+        return dict(STUB_PASS_REPORT)
+
+    monkeypatch.setattr(runner, "_replay", stub_replay)
+    monkeypatch.setenv("MCP_TESTER_ROOT", str(tmp_path))
+
+    result = await runner.validate_suite_async(MINIMAL_SUITE_YAML, verify_replay=True)
+
+    assert result["valid"] is True
+    assert "verify_replay" in result
+    assert result["verify_replay"]["result"] == "pass"
+    assert len(replay_calls) == 1, "_replay must be called exactly once"
+
+
+@pytest.mark.anyio
+async def test_validate_suite_async_inline_yaml_invalid_schema(monkeypatch, tmp_path):
+    """A YAML mapping that fails suites.validate propagates SuiteError (not silent)."""
+    monkeypatch.setenv("MCP_TESTER_ROOT", str(tmp_path))
+    # schema: 99 with no suite/servers/steps — structurally invalid.
+    bad_yaml = "schema: 99\n"
+
+    with pytest.raises(suites.SuiteError):
+        await runner.validate_suite_async(bad_yaml, verify_replay=False)
+
+
+@pytest.mark.anyio
+async def test_validate_suite_async_inline_not_a_mapping(monkeypatch, tmp_path):
+    """A YAML string that parses to a list (not a mapping) must raise SuiteError."""
+    monkeypatch.setenv("MCP_TESTER_ROOT", str(tmp_path))
+    not_a_mapping = "- a\n- b\n"
+
+    with pytest.raises(suites.SuiteError):
+        await runner.validate_suite_async(not_a_mapping, verify_replay=False)
+
+
+@pytest.mark.anyio
+async def test_validate_suite_async_file_path_still_works(monkeypatch, tmp_path):
+    """File-path branch is not broken: a saved-suite name resolves to suite_file, no inline key."""
+    async def stub_replay(*_args, **_kwargs) -> dict[str, Any]:
+        return dict(STUB_PASS_REPORT)
+
+    monkeypatch.setattr(runner, "_replay", stub_replay)
+    _make_suite_file(tmp_path)
+    monkeypatch.setenv("MCP_TESTER_ROOT", str(tmp_path))
+
+    result = await runner.validate_suite_async("test__minimal", verify_replay=False)
+
+    assert result["valid"] is True
+    assert "suite_file" in result
+    assert "inline" not in result
+
+
+@pytest.mark.anyio
+async def test_validate_suite_async_invalid_file_schema_error_propagates(monkeypatch, tmp_path):
+    """Regression: a suite file that exists but fails schema validation must raise a schema
+    SuiteError — NOT the generic 'not a file path / not a YAML mapping' fallback.
+
+    The narrowed try/except (only around resolve_suite_path) ensures suites.load's
+    SuiteError propagates directly instead of being swallowed and retried as inline YAML.
+    """
+    sdir = tmp_path / "mcp-suites"
+    sdir.mkdir()
+    # Write a structurally invalid suite (wrong schema version, no suite/steps).
+    invalid_doc = {"schema": 99, "note": "this is invalid"}
+    invalid_file = sdir / "invalid-suite.yaml"
+    invalid_file.write_text(
+        yaml.safe_dump(invalid_doc, sort_keys=False), encoding="utf-8"
+    )
+    monkeypatch.setenv("MCP_TESTER_ROOT", str(tmp_path))
+
+    with pytest.raises(suites.SuiteError) as exc_info:
+        await runner.validate_suite_async("invalid-suite", verify_replay=False)
+
+    # The error must reflect the schema problem, not the generic inline-YAML fallback message.
+    error_msg = str(exc_info.value)
+    assert "not a file path" not in error_msg, (
+        f"Got fallback message instead of schema error: {error_msg!r}"
+    )
+    assert "not a YAML mapping" not in error_msg, (
+        f"Got fallback message instead of schema error: {error_msg!r}"
+    )
