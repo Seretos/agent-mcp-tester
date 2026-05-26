@@ -26,7 +26,7 @@ def ping() -> str:
 
 
 @mcp.tool()
-def run_suite(suite: str, policy: str = "continue") -> dict:
+async def run_suite(suite: str, policy: str = "continue") -> dict:
     """Replay a recorded suite deterministically over raw MCP stdio (zero LLM).
 
     `suite` is a suite name or path under mcp-suites/. `policy` is "continue"
@@ -35,7 +35,7 @@ def run_suite(suite: str, policy: str = "continue") -> dict:
     """
     from . import runner
 
-    return runner.run(suite, policy=policy)
+    return await runner.run_async(suite, policy=policy)
 
 
 @mcp.tool()
@@ -47,16 +47,16 @@ def list_suites() -> list:
 
 
 @mcp.tool()
-def validate_suite(suite: str, verify_replay: bool = True) -> dict:
+async def validate_suite(suite: str, verify_replay: bool = True) -> dict:
     """Schema-validate a suite; if verify_replay, also replay it once to confirm
     its assertions hold against the live MCP."""
     from . import runner
 
-    return runner.validate_suite(suite, verify_replay=verify_replay)
+    return await runner.validate_suite_async(suite, verify_replay=verify_replay)
 
 
 @mcp.tool()
-def save_suite(suite_yaml: str, verify_replay: bool = True, filename: str = "") -> dict:
+async def save_suite(suite_yaml: str, verify_replay: bool = True, filename: str = "") -> dict:
     """Persist a recorded suite (YAML text) into mcp-suites/.
 
     With verify_replay on (default), the suite is replayed once before being
@@ -65,7 +65,7 @@ def save_suite(suite_yaml: str, verify_replay: bool = True, filename: str = "") 
     """
     from . import runner
 
-    return runner.save_suite(
+    return await runner.save_suite_async(
         suite_yaml, verify_replay=verify_replay, filename=filename or None
     )
 
