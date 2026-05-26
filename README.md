@@ -1,3 +1,5 @@
+<img src="assets/icon.png" alt="agent-mcp-tester icon" width="128">
+
 # agent-mcp-tester
 
 E2E-tests MCP servers: LLM-driven sweeps that record repeatable test suites, plus a deterministic runner that replays them with zero LLM tokens.

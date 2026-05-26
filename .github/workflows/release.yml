@@ -208,6 +208,12 @@ jobs:
           if [ -d stamped/agents ]; then
             cp -a stamped/agents "$STAGE/"
           fi
+          if [ -d stamped/assets ]; then
+            cp -a stamped/assets "$STAGE/"
+          fi
+          if [ ! -f "$STAGE/assets/icon.png" ]; then
+            echo "::error::missing assets/icon.png in merged stage"; exit 1
+          fi
 
           # Merge every per-OS bin payload. Each build job uploads to
           # bins/bin-<os>/ which contains the OS-specific binary
@@ -335,6 +341,7 @@ jobs:
           # read no longer exists here (wiped by the orphan-branch git clean).
           DESC:    ${{ needs.stamp.outputs.description }}
           REPO:    ${{ github.repository }}
+          ICON:    "https://raw.githubusercontent.com/${{ github.repository }}/${{ needs.stamp.outputs.tag }}/assets/icon.png"
         run: |
           # Build the payload with jq so name/description are correctly JSON-escaped.
           PAYLOAD=$(jq -n \
@@ -343,6 +350,7 @@ jobs:
             --arg repo        "$REPO" \
             --arg version     "$VERSION" \
             --arg ref         "$TAG" \
+            --arg icon        "$ICON" \
             '{event_type: "plugin-release",
               client_payload: {
                 name:        $name,
@@ -350,7 +358,8 @@ jobs:
                 repo:        $repo,
                 category:    "mcp",
                 version:     $version,
-                ref:         $ref
+                ref:         $ref,
+                icon:        $icon
               }}')
           curl -fsSL -X POST \
             -H "Authorization: Bearer $GH_PAT" \
