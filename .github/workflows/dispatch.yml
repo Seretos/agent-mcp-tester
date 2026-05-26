@@ -60,6 +60,7 @@ jobs:
           DESC:    ${{ steps.meta.outputs.description }}
           VERSION: ${{ steps.tag.outputs.version }}
           TAG:     ${{ steps.tag.outputs.tag }}
+          REPO:    ${{ github.repository }}
         shell: bash
         run: |
           curl -fsSL -X POST \
@@ -72,10 +73,11 @@ jobs:
             "client_payload": {
               "name":        "${NAME}",
               "description": "${DESC}",
-              "repo":        "${{ github.repository }}",
+              "repo":        "${REPO}",
               "category":    "mcp",
               "version":     "${VERSION}",
-              "ref":         "${TAG}"
+              "ref":         "${TAG}",
+              "icon":        "https://raw.githubusercontent.com/${REPO}/${TAG}/assets/icon.png"
             }
           }
           EOF
