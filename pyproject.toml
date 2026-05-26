@@ -20,6 +20,7 @@ build = [
 ]
 test = [
   "pytest>=8",
+  "anyio>=4",
 ]
 
 [tool.setuptools]
@@ -32,3 +33,6 @@ where = ["src"]
 testpaths = ["tests"]
 pythonpath = ["src"]
 addopts = "-ra --strict-markers"
+markers = [
+  "anyio: run the test on the anyio event loop (provided by the anyio pytest plugin)",
+]

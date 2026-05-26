@@ -1,10 +1,13 @@
 """Unit tests for the deterministic runner's pure logic (no MCP, no network)."""
 
 import os
+from pathlib import Path
+from typing import Any
 
 import pytest
+import yaml
 
-from mcp_tester_plugin import assertions, suites
+from mcp_tester_plugin import assertions, runner, suites
 
 
 # --------------------------------------------------------------------------
@@ -176,3 +179,188 @@ def test_dataflow_warns_on_use_before_capture():
 
 def test_dataflow_clean_for_good_suite():
     assert suites.dataflow_warnings(GOOD_SUITE) == []
+
+
+# --------------------------------------------------------------------------
+# Minimal valid suite fixture for async tests
+# --------------------------------------------------------------------------
+MINIMAL_SUITE_DOC: dict[str, Any] = {
+    "schema": 1,
+    "suite": "test / minimal",
+    "servers": {"s": {"plugin": "fake"}},
+    "steps": [
+        {"id": "step1", "server": "s", "tool": "fake_tool"},
+    ],
+}
+
+STUB_PASS_REPORT: dict[str, Any] = {
+    "suite": "test / minimal",
+    "run_id": "e2e-stub",
+    "result": "pass",
+    "counts": {"steps": 1, "passed": 1, "failed": 0, "teardown_warnings": 0},
+    "servers": [],
+    "steps": [],
+    "regressions": [],
+    "teardown_warnings": [],
+    "started_at": "2024-01-01T00:00:00Z",
+    "duration_ms": 0,
+    "policy": "continue",
+}
+
+STUB_FAIL_REPORT: dict[str, Any] = {
+    **STUB_PASS_REPORT,
+    "result": "regression",
+    "regressions": [{"id": "r1"}],
+}
+
+
+def _make_suite_file(tmp_path: Path) -> Path:
+    """Write MINIMAL_SUITE_DOC into a temp mcp-suites dir and return its path."""
+    sdir = tmp_path / "mcp-suites"
+    sdir.mkdir()
+    suite_path = sdir / "test__minimal.yaml"
+    suite_path.write_text(
+        yaml.safe_dump(MINIMAL_SUITE_DOC, sort_keys=False), encoding="utf-8"
+    )
+    return suite_path
+
+
+# --------------------------------------------------------------------------
+# Regression: sync run() must NOT be called from within a running event loop
+# --------------------------------------------------------------------------
+@pytest.mark.anyio
+async def test_run_from_running_loop_crashes(monkeypatch, tmp_path):
+    """The SYNC runner.run() raises RuntimeError when called from a running loop.
+
+    This documents the original crash (asyncio.run / anyio.run inside an
+    already-running loop). The async entry points introduced to fix the bug
+    avoid this path entirely.
+    """
+    async def stub_replay(*_args, **_kwargs) -> dict[str, Any]:
+        return STUB_PASS_REPORT
+
+    monkeypatch.setattr(runner, "_replay", stub_replay)
+    suite_path = _make_suite_file(tmp_path)
+    monkeypatch.setenv("MCP_TESTER_ROOT", str(tmp_path))
+
+    with pytest.raises(RuntimeError):
+        runner.run("test__minimal")
+
+
+# --------------------------------------------------------------------------
+# Async entry points: happy-path and edge-cases (all stub _replay, no network)
+# --------------------------------------------------------------------------
+@pytest.mark.anyio
+async def test_run_async_returns_stub_report(monkeypatch, tmp_path):
+    """run_async awaits _replay and returns the report enriched with suite_file."""
+    async def stub_replay(*_args, **_kwargs) -> dict[str, Any]:
+        return dict(STUB_PASS_REPORT)
+
+    monkeypatch.setattr(runner, "_replay", stub_replay)
+    _make_suite_file(tmp_path)
+    monkeypatch.setenv("MCP_TESTER_ROOT", str(tmp_path))
+
+    result = await runner.run_async("test__minimal")
+
+    assert result["result"] == "pass"
+    assert "suite_file" in result
+    assert "test__minimal" in result["suite_file"]
+
+
+@pytest.mark.anyio
+async def test_validate_suite_async_no_replay(monkeypatch, tmp_path):
+    """validate_suite_async with verify_replay=False parses the file and returns
+    valid=True without ever calling _replay."""
+    replay_called = []
+
+    async def stub_replay(*_args, **_kwargs) -> dict[str, Any]:
+        replay_called.append(True)
+        return dict(STUB_PASS_REPORT)
+
+    monkeypatch.setattr(runner, "_replay", stub_replay)
+    _make_suite_file(tmp_path)
+    monkeypatch.setenv("MCP_TESTER_ROOT", str(tmp_path))
+
+    result = await runner.validate_suite_async("test__minimal", verify_replay=False)
+
+    assert result["valid"] is True
+    assert "suite_file" in result
+    assert replay_called == [], "_replay must not be called when verify_replay=False"
+
+
+@pytest.mark.anyio
+async def test_validate_suite_async_with_replay(monkeypatch, tmp_path):
+    """validate_suite_async with verify_replay=True calls _replay and reflects result."""
+    async def stub_replay(*_args, **_kwargs) -> dict[str, Any]:
+        return dict(STUB_PASS_REPORT)
+
+    monkeypatch.setattr(runner, "_replay", stub_replay)
+    _make_suite_file(tmp_path)
+    monkeypatch.setenv("MCP_TESTER_ROOT", str(tmp_path))
+
+    result = await runner.validate_suite_async("test__minimal", verify_replay=True)
+
+    assert result["valid"] is True
+    assert "verify_replay" in result
+    assert result["verify_replay"]["result"] == "pass"
+
+
+@pytest.mark.anyio
+async def test_save_suite_async_no_replay(monkeypatch, tmp_path):
+    """save_suite_async with verify_replay=False writes the file without calling _replay."""
+    replay_called = []
+
+    async def stub_replay(*_args, **_kwargs) -> dict[str, Any]:
+        replay_called.append(True)
+        return dict(STUB_PASS_REPORT)
+
+    monkeypatch.setattr(runner, "_replay", stub_replay)
+    monkeypatch.setenv("MCP_TESTER_ROOT", str(tmp_path))
+    # Ensure mcp-suites dir exists so save() can write to it
+    (tmp_path / "mcp-suites").mkdir(exist_ok=True)
+
+    suite_yaml = yaml.safe_dump(MINIMAL_SUITE_DOC, sort_keys=False)
+    result = await runner.save_suite_async(suite_yaml, verify_replay=False)
+
+    assert result["saved"] is True
+    assert "path" in result
+    assert Path(result["path"]).is_file()
+    assert replay_called == [], "_replay must not be called when verify_replay=False"
+
+
+@pytest.mark.anyio
+async def test_save_suite_async_replay_fails(monkeypatch, tmp_path):
+    """save_suite_async does NOT write the file when replay returns a non-pass result."""
+    async def stub_replay(*_args, **_kwargs) -> dict[str, Any]:
+        return dict(STUB_FAIL_REPORT)
+
+    monkeypatch.setattr(runner, "_replay", stub_replay)
+    monkeypatch.setenv("MCP_TESTER_ROOT", str(tmp_path))
+    (tmp_path / "mcp-suites").mkdir(exist_ok=True)
+
+    suite_yaml = yaml.safe_dump(MINIMAL_SUITE_DOC, sort_keys=False)
+    result = await runner.save_suite_async(suite_yaml, verify_replay=True)
+
+    assert result["saved"] is False
+    assert "error" in result
+    # No file should have been written
+    saved_files = list((tmp_path / "mcp-suites").glob("*.yaml"))
+    assert saved_files == []
+
+
+@pytest.mark.anyio
+async def test_save_suite_async_replay_passes(monkeypatch, tmp_path):
+    """save_suite_async writes the file when replay returns a pass result."""
+    async def stub_replay(*_args, **_kwargs) -> dict[str, Any]:
+        return dict(STUB_PASS_REPORT)
+
+    monkeypatch.setattr(runner, "_replay", stub_replay)
+    monkeypatch.setenv("MCP_TESTER_ROOT", str(tmp_path))
+    (tmp_path / "mcp-suites").mkdir(exist_ok=True)
+
+    suite_yaml = yaml.safe_dump(MINIMAL_SUITE_DOC, sort_keys=False)
+    result = await runner.save_suite_async(suite_yaml, verify_replay=True)
+
+    assert result["saved"] is True
+    assert "path" in result
+    assert Path(result["path"]).is_file()

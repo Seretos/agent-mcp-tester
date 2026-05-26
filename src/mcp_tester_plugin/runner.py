@@ -121,6 +121,98 @@ def save_suite(
 
 
 # --------------------------------------------------------------------------
+# Async entry points (called from within FastMCP's already-running event loop)
+# --------------------------------------------------------------------------
+async def run_async(
+    suite: str,
+    *,
+    root: Path | None = None,
+    policy: str = "continue",
+    overrides: dict[str, str] | None = None,
+) -> dict[str, Any]:
+    root = root or suites.find_root()
+    path = suites.resolve_suite_path(suite, root)
+    doc = suites.load(path)
+    rep = await _replay(doc, root, overrides or {}, policy)
+    rep["suite_file"] = str(path)
+    return rep
+
+
+async def run_doc_async(
+    doc: dict[str, Any],
+    *,
+    root: Path | None = None,
+    policy: str = "continue",
+    overrides: dict[str, str] | None = None,
+) -> dict[str, Any]:
+    root = root or suites.find_root()
+    suites.validate(doc)
+    return await _replay(doc, root, overrides or {}, policy)
+
+
+async def validate_suite_async(
+    suite: str,
+    *,
+    root: Path | None = None,
+    verify_replay: bool = True,
+    overrides: dict[str, str] | None = None,
+) -> dict[str, Any]:
+    root = root or suites.find_root()
+    path = suites.resolve_suite_path(suite, root)
+    doc = suites.load(path)  # raises SuiteError on structural problems
+    out: dict[str, Any] = {
+        "valid": True,
+        "suite_file": str(path),
+        "dataflow_warnings": suites.dataflow_warnings(doc),
+    }
+    if verify_replay:
+        rep = await _replay(doc, root, overrides or {}, "continue")
+        out["verify_replay"] = rep
+        out["valid"] = rep.get("result") == "pass"
+    return out
+
+
+async def save_suite_async(
+    suite_yaml: str,
+    *,
+    root: Path | None = None,
+    verify_replay: bool = True,
+    filename: str | None = None,
+    overrides: dict[str, str] | None = None,
+) -> dict[str, Any]:
+    """Validate, optionally verify-replay, then persist a recorded suite.
+
+    If ``verify_replay`` is on and the replay does not pass, the suite is NOT
+    written — the failing assertions are returned so the recorder can downgrade
+    a mis-marked volatile field before committing.
+    """
+    root = root or suites.find_root()
+    doc = yaml.safe_load(suite_yaml)
+    if not isinstance(doc, dict):
+        return {"saved": False, "error": "suite YAML is not a mapping"}
+    try:
+        suites.validate(doc)
+    except suites.SuiteError as exc:
+        return {"saved": False, "error": str(exc)}
+
+    out: dict[str, Any] = {
+        "saved": False,
+        "dataflow_warnings": suites.dataflow_warnings(doc),
+    }
+    if verify_replay:
+        rep = await _replay(doc, root, overrides or {}, "continue")
+        out["verify_replay"] = rep
+        if rep.get("result") != "pass":
+            out["error"] = "verify-replay did not pass; suite not saved"
+            return out
+
+    path = suites.save(doc, root=root, filename=filename)
+    out["saved"] = True
+    out["path"] = str(path)
+    return out
+
+
+# --------------------------------------------------------------------------
 # The async replay core
 # --------------------------------------------------------------------------
 async def _replay(
