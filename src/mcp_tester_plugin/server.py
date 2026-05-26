@@ -48,8 +48,20 @@ def list_suites() -> list:
 
 @mcp.tool()
 async def validate_suite(suite: str, verify_replay: bool = True) -> dict:
-    """Schema-validate a suite; if verify_replay, also replay it once to confirm
-    its assertions hold against the live MCP."""
+    """Schema-validate a suite without writing to disk.
+
+    `suite` accepts either:
+    - a saved-suite name or path under mcp-suites/ (resolved from disk), or
+    - raw YAML text of a suite document (write-free schema check, useful for
+      validating a draft before calling save_suite).
+
+    If `verify_replay` is True (default), the suite is also replayed once
+    against the live MCP to confirm its assertions hold.
+
+    Returns a dict with `valid` (bool) and `dataflow_warnings`. When loaded
+    from a file, `suite_file` is included. When parsed from inline YAML,
+    `inline: true` is included instead and no file is written.
+    """
     from . import runner
 
     return await runner.validate_suite_async(suite, verify_replay=verify_replay)

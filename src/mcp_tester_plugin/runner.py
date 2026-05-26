@@ -66,13 +66,31 @@ def validate_suite(
     overrides: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     root = root or suites.find_root()
-    path = suites.resolve_suite_path(suite, root)
-    doc = suites.load(path)  # raises SuiteError on structural problems
-    out: dict[str, Any] = {
-        "valid": True,
-        "suite_file": str(path),
-        "dataflow_warnings": suites.dataflow_warnings(doc),
-    }
+    is_inline = False
+    try:
+        path = suites.resolve_suite_path(suite, root)
+    except suites.SuiteError:
+        is_inline = True
+
+    if is_inline:
+        doc = yaml.safe_load(suite)
+        if not isinstance(doc, dict):
+            raise suites.SuiteError(
+                "suite input is not a file path/name and does not parse as a YAML mapping"
+            )
+        suites.validate(doc)  # schema SuiteError propagates
+        out: dict[str, Any] = {
+            "valid": True,
+            "inline": True,
+            "dataflow_warnings": suites.dataflow_warnings(doc),
+        }
+    else:
+        doc = suites.load(path)  # schema SuiteError propagates
+        out = {
+            "valid": True,
+            "suite_file": str(path),
+            "dataflow_warnings": suites.dataflow_warnings(doc),
+        }
     if verify_replay:
         rep = anyio.run(_replay, doc, root, overrides or {}, "continue")
         out["verify_replay"] = rep
@@ -158,13 +176,31 @@ async def validate_suite_async(
     overrides: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     root = root or suites.find_root()
-    path = suites.resolve_suite_path(suite, root)
-    doc = suites.load(path)  # raises SuiteError on structural problems
-    out: dict[str, Any] = {
-        "valid": True,
-        "suite_file": str(path),
-        "dataflow_warnings": suites.dataflow_warnings(doc),
-    }
+    is_inline = False
+    try:
+        path = suites.resolve_suite_path(suite, root)
+    except suites.SuiteError:
+        is_inline = True
+
+    if is_inline:
+        doc = yaml.safe_load(suite)
+        if not isinstance(doc, dict):
+            raise suites.SuiteError(
+                "suite input is not a file path/name and does not parse as a YAML mapping"
+            )
+        suites.validate(doc)  # schema SuiteError propagates
+        out: dict[str, Any] = {
+            "valid": True,
+            "inline": True,
+            "dataflow_warnings": suites.dataflow_warnings(doc),
+        }
+    else:
+        doc = suites.load(path)  # schema SuiteError propagates
+        out = {
+            "valid": True,
+            "suite_file": str(path),
+            "dataflow_warnings": suites.dataflow_warnings(doc),
+        }
     if verify_replay:
         rep = await _replay(doc, root, overrides or {}, "continue")
         out["verify_replay"] = rep
