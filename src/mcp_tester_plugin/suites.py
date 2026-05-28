@@ -216,6 +216,12 @@ def _validate_step(
     cap = step.get("capture")
     if cap is not None and not isinstance(cap, dict):
         raise SuiteError(f"step {sid!r} 'capture' must be a mapping")
+    _NEAR_MISS_ASSERTION_KEYS = {"assert", "assertions", "assertion", "asserts"}
+    for key in _NEAR_MISS_ASSERTION_KEYS:
+        if key in step:
+            raise SuiteError(
+                f"step {sid!r} uses {key!r} which is not valid; did you mean 'expect:'?"
+            )
 
 
 def dataflow_warnings(doc: dict[str, Any]) -> list[str]:
