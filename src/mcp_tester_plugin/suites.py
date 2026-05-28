@@ -77,7 +77,19 @@ def load(path: Path) -> dict[str, Any]:
 
 
 def resolve_suite_path(name: str, root: Path | None = None) -> Path:
-    """Accept a bare suite name, a filename, or a full/relative path."""
+    """Accept a bare suite name, a filename, a full/relative path, or the
+    ``suite:`` field value from any suite in the suites directory.
+
+    Resolution order:
+    1. ``name`` is an existing file path → return it directly.
+    2. ``<suites-dir>/name``, ``<suites-dir>/name.yaml``, or
+       ``<suites-dir>/name.yml`` exists → return the first match.
+    3. Scan every ``*.y*ml`` file in the suites directory (excluding
+       ``targets.yaml``) and return the first file whose ``suite:`` field
+       exactly matches ``name``.  Corrupt / non-mapping files are silently
+       skipped so one bad file cannot block resolution of a valid one.
+    4. Raise :exc:`SuiteError` with the same message as before.
+    """
     p = Path(name)
     if p.is_file():
         return p.resolve()
@@ -85,6 +97,17 @@ def resolve_suite_path(name: str, root: Path | None = None) -> Path:
     for cand in (sdir / name, sdir / f"{name}.yaml", sdir / f"{name}.yml"):
         if cand.is_file():
             return cand.resolve()
+    # Fallback: scan for a file whose `suite:` field matches `name`.
+    if sdir.is_dir():
+        for path in sorted(sdir.glob("*.y*ml")):
+            if path.name == TARGETS_FILENAME:
+                continue
+            try:
+                doc = yaml.safe_load(path.read_text(encoding="utf-8"))
+                if isinstance(doc, dict) and doc.get("suite") == name:
+                    return path.resolve()
+            except Exception:  # noqa: BLE001
+                continue
     raise SuiteError(f"no suite matching {name!r} under {sdir}")
 
 

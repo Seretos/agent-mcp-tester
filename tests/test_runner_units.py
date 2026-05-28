@@ -485,3 +485,118 @@ async def test_validate_suite_async_invalid_file_schema_error_propagates(monkeyp
     assert "not a YAML mapping" not in error_msg, (
         f"Got fallback message instead of schema error: {error_msg!r}"
     )
+
+
+# --------------------------------------------------------------------------
+# resolve_suite_path: suite-field resolution (Finding B)
+# --------------------------------------------------------------------------
+
+SUITE_FIELD_DOC: dict[str, Any] = {
+    "schema": 1,
+    "suite": "agent-worktree / worktree-lifecycle",
+    "servers": {"aw": {"plugin": "agent-worktree"}},
+    "steps": [
+        {"id": "step1", "server": "aw", "tool": "list_worktrees"},
+    ],
+}
+
+
+def _make_suite_field_file(tmp_path: Path) -> Path:
+    """Write SUITE_FIELD_DOC into a temp mcp-suites dir and return its path."""
+    sdir = tmp_path / "mcp-suites"
+    sdir.mkdir(exist_ok=True)
+    suite_path = sdir / "agent-worktree__worktree-lifecycle.yaml"
+    suite_path.write_text(
+        yaml.safe_dump(SUITE_FIELD_DOC, sort_keys=False), encoding="utf-8"
+    )
+    return suite_path
+
+
+def test_resolve_suite_path_by_suite_field(tmp_path):
+    """Regression: resolve_suite_path must resolve by the human-readable suite: field value."""
+    suite_path = _make_suite_field_file(tmp_path)
+
+    # Temporarily set the env var using os.environ directly (pure function test).
+    orig = os.environ.copy()
+    try:
+        os.environ["MCP_TESTER_ROOT"] = str(tmp_path)
+        result = suites.resolve_suite_path("agent-worktree / worktree-lifecycle")
+        assert result.is_file()
+        assert result == suite_path.resolve()
+    finally:
+        # Restore env to avoid polluting other tests.
+        for k in list(os.environ):
+            if k not in orig:
+                del os.environ[k]
+        os.environ.update(orig)
+
+
+def test_resolve_suite_path_filename_still_wins(tmp_path, monkeypatch):
+    """Filename-stem resolution must still work after the suite-field scan is added."""
+    _make_suite_field_file(tmp_path)
+    monkeypatch.setenv("MCP_TESTER_ROOT", str(tmp_path))
+
+    result = suites.resolve_suite_path("agent-worktree__worktree-lifecycle")
+    assert result.is_file()
+    assert result.name == "agent-worktree__worktree-lifecycle.yaml"
+
+
+def test_resolve_suite_path_no_match_raises(tmp_path, monkeypatch):
+    """An unknown name raises SuiteError whether or not a suites dir exists."""
+    sdir = tmp_path / "mcp-suites"
+    sdir.mkdir()
+    monkeypatch.setenv("MCP_TESTER_ROOT", str(tmp_path))
+
+    with pytest.raises(suites.SuiteError, match="no suite matching"):
+        suites.resolve_suite_path("completely-unknown / suite-name")
+
+
+def test_resolve_suite_path_skips_corrupt_file(tmp_path, monkeypatch):
+    """A corrupt YAML file alongside a valid one must not prevent resolution by suite: field."""
+    sdir = tmp_path / "mcp-suites"
+    sdir.mkdir()
+    # Corrupt file that will fail yaml.safe_load.
+    (sdir / "corrupt.yaml").write_text("key: [\nunot closed", encoding="utf-8")
+    # Valid file with the target suite: field.
+    valid_path = sdir / "valid-suite.yaml"
+    valid_path.write_text(
+        yaml.safe_dump(SUITE_FIELD_DOC, sort_keys=False), encoding="utf-8"
+    )
+    monkeypatch.setenv("MCP_TESTER_ROOT", str(tmp_path))
+
+    result = suites.resolve_suite_path("agent-worktree / worktree-lifecycle")
+    assert result == valid_path.resolve()
+
+
+def test_resolve_suite_path_skips_targets_yaml(tmp_path, monkeypatch):
+    """targets.yaml must not be scanned even if it contains a suite-like key."""
+    sdir = tmp_path / "mcp-suites"
+    sdir.mkdir()
+    # Put a targets.yaml that happens to have a "suite" key to be extra sure.
+    targets = sdir / "targets.yaml"
+    targets.write_text(
+        yaml.safe_dump({"suite": "agent-worktree / worktree-lifecycle", "servers": {}}),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("MCP_TESTER_ROOT", str(tmp_path))
+
+    # Without any valid suite file the lookup must fail (targets.yaml was skipped).
+    with pytest.raises(suites.SuiteError, match="no suite matching"):
+        suites.resolve_suite_path("agent-worktree / worktree-lifecycle")
+
+
+@pytest.mark.anyio
+async def test_run_async_resolves_by_suite_field(monkeypatch, tmp_path):
+    """run_async must accept the human-readable suite: field value as the suite identifier."""
+    async def stub_replay(*_args, **_kwargs) -> dict[str, Any]:
+        return dict(STUB_PASS_REPORT)
+
+    monkeypatch.setattr(runner, "_replay", stub_replay)
+    _make_suite_field_file(tmp_path)
+    monkeypatch.setenv("MCP_TESTER_ROOT", str(tmp_path))
+
+    result = await runner.run_async("agent-worktree / worktree-lifecycle")
+
+    assert result["result"] == "pass"
+    assert "suite_file" in result
+    assert "worktree-lifecycle" in result["suite_file"]

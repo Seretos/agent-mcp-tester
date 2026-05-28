@@ -29,9 +29,15 @@ def ping() -> str:
 async def run_suite(suite: str, policy: str = "continue") -> dict:
     """Replay a recorded suite deterministically over raw MCP stdio (zero LLM).
 
-    `suite` is a suite name or path under mcp-suites/. `policy` is "continue"
-    (run all steps, collect every regression) or "abort" (stop at first failure).
-    Returns a structured report whose `regressions` feed the file-findings skill.
+    `suite` accepts:
+    - a filename stem (e.g. ``agent-worktree__worktree-lifecycle``),
+    - a file path under ``mcp-suites/`` (relative or absolute), or
+    - the human-readable ``suite:`` field value returned by ``list_suites``
+      (e.g. ``"agent-worktree / worktree-lifecycle"``).
+
+    `policy` is "continue" (run all steps, collect every regression) or
+    "abort" (stop at first failure). Returns a structured report whose
+    `regressions` feed the file-findings skill.
     """
     from . import runner
 
