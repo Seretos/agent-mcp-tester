@@ -157,6 +157,40 @@ def test_validate_rejects_unknown_server():
         suites.validate(bad)
 
 
+def test_validate_rejects_near_miss_assertion_key_assertions():
+    bad = {
+        **GOOD_SUITE,
+        "steps": [
+            {
+                "id": "x",
+                "server": "pi",
+                "tool": "t",
+                "assertions": [{"path": "$.id", "op": "exists"}],
+            }
+        ],
+    }
+    with pytest.raises(suites.SuiteError) as exc_info:
+        suites.validate(bad)
+    assert "expect" in str(exc_info.value)
+
+
+def test_validate_rejects_near_miss_assertion_key_assert():
+    bad = {
+        **GOOD_SUITE,
+        "steps": [
+            {
+                "id": "x",
+                "server": "pi",
+                "tool": "t",
+                "assert": [{"path": "$.id", "op": "exists"}],
+            }
+        ],
+    }
+    with pytest.raises(suites.SuiteError) as exc_info:
+        suites.validate(bad)
+    assert "expect" in str(exc_info.value)
+
+
 def test_default_filename():
     assert (
         suites.default_filename(GOOD_SUITE)
