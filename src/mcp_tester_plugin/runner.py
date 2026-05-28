@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import secrets
 import sys
 import time
@@ -381,7 +382,7 @@ async def _exec_step(
     is_teardown: bool,
 ) -> dict[str, Any]:
     sid = step.get("id")
-    tool = step.get("tool")
+    tool = _strip_tool_prefix(step.get("tool") or "")
     logical = step.get("server") or (next(iter(sessions)) if len(sessions) == 1 else None)
     out: dict[str, Any] = {"id": sid, "server": logical, "tool": tool}
 
@@ -508,6 +509,36 @@ async def _exec_step(
 # --------------------------------------------------------------------------
 # Helpers
 # --------------------------------------------------------------------------
+
+# Pattern: mcp__ followed by one or more non-empty underscore-delimited
+# segments, then a closing __.  Requires at least one segment so that a bare
+# ``mcp__`` without a closing ``__`` is NOT stripped.
+_PREFIX_RE = re.compile(r"^mcp__plugin_[^_][^_]*(?:_[^_][^_]*)*__")
+
+
+def _strip_tool_prefix(name: str) -> str:
+    """Strip the Claude Code harness prefix from a recorded tool name.
+
+    Claude Code stores tool names as ``mcp__plugin_<plugin-name>__<bare-name>``
+    in suite ``tool:`` fields, but raw MCP stdio advertises only the bare name.
+    This helper normalises recorded names to their bare form so the runner can
+    match them against the server's ``list_tools`` response.
+
+    - Bare names (no prefix) pass through unchanged.
+    - Names that START with ``mcp__`` but LACK a proper closing ``__`` are also
+      returned unchanged (no over-eager strip).
+    - Non-string inputs (e.g. an integer from a malformed YAML ``tool:`` field)
+      are returned unchanged so callers can handle them gracefully downstream.
+    - The function is idempotent.
+    """
+    if not name or not isinstance(name, str):
+        return name
+    m = _PREFIX_RE.match(name)
+    if m:
+        return name[m.end():]
+    return name
+
+
 def _referenced_servers(doc: dict[str, Any], specs: dict[str, Any]) -> list[str]:
     order: list[str] = []
     sole = next(iter(specs)) if len(specs) == 1 else None

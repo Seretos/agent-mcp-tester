@@ -135,7 +135,12 @@ once, so future runs replay it with **zero LLM** via the `replay-suite` skill / 
 
 1. **Collect fragments.** Each `cluster-tester` you spawned with `record: true` returns a fenced
    **"Recorded suite fragment"** block (steps + assertions + teardown, referencing only its `server_ref`)
-   alongside its digest.
+   alongside its digest. Note the naming distinction: the `tool_list` you gave each worker uses
+   **fully-qualified harness names** (`mcp__plugin_<plugin>_<server>__<bare>`) because those are required
+   for `ToolSearch` — but the `tool:` field in each recorded fragment step must use only the **bare name**
+   (e.g. `create_ticket`, not `mcp__plugin_...__create_ticket`). Suites with prefixed `tool:` fields will
+   still replay correctly (the runner strips the prefix at runtime), but they trigger a dataflow warning and
+   are harder to read.
 2. **Assemble a full suite per cluster.** You — not the worker — own the parts that touch how the server is
    reached. Wrap each fragment into a complete suite document:
 
