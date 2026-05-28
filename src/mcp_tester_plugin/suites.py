@@ -22,6 +22,10 @@ SCHEMA_VERSION = 1
 SUITES_DIRNAME = "mcp-suites"
 TARGETS_FILENAME = "targets.yaml"
 
+# Pattern mirrors _PREFIX_RE in runner.py: mcp__ + one-or-more non-empty
+# underscore-delimited segments + closing __.
+_TOOL_PREFIX_RE = re.compile(r"^mcp__plugin_[^_][^_]*(?:_[^_][^_]*)*__")
+
 
 class SuiteError(ValueError):
     """A suite file is structurally invalid."""
@@ -224,6 +228,10 @@ def dataflow_warnings(doc: dict[str, Any]) -> list[str]:
     ``RUN_ID``, ``env:*`` and ``sandbox.*`` are always considered bound. A
     capture binds its names for subsequent steps. Teardown sees everything the
     steps captured.
+
+    Also warns when a step's ``tool:`` field contains a Claude Code harness
+    prefix (``mcp__plugin_<...>__``). The runner strips the prefix at runtime,
+    so the suite is still valid, but recording bare names is preferred.
     """
     warnings: list[str] = []
     bound: set[str] = {"RUN_ID"}
@@ -237,6 +245,12 @@ def dataflow_warnings(doc: dict[str, Any]) -> list[str]:
                 continue
             if ref not in available:
                 warnings.append(f"{where}: '${{{ref}}}' used before it is captured")
+        tool = step.get("tool") or ""
+        if isinstance(tool, str) and _TOOL_PREFIX_RE.match(tool):
+            warnings.append(
+                f"{where}: tool {tool!r} contains a harness prefix; "
+                "prefer recording the bare tool name"
+            )
 
     for i, step in enumerate(doc.get("steps") or []):
         _check(step, f"steps[{i}]={step.get('id')}", bound)

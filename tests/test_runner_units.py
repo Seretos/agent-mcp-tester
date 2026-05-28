@@ -600,3 +600,210 @@ async def test_run_async_resolves_by_suite_field(monkeypatch, tmp_path):
     assert result["result"] == "pass"
     assert "suite_file" in result
     assert "worktree-lifecycle" in result["suite_file"]
+
+
+# --------------------------------------------------------------------------
+# _strip_tool_prefix unit tests
+# --------------------------------------------------------------------------
+
+def test_strip_prefix_removes_standard_prefix():
+    """Full Claude Code harness prefix is stripped, leaving the bare tool name."""
+    name = "mcp__plugin_agent-project-issues_project-issues__list_ticket_statuses"
+    assert runner._strip_tool_prefix(name) == "list_ticket_statuses"
+
+
+def test_strip_prefix_bare_name_unchanged():
+    """A bare name (no prefix) passes through unchanged."""
+    assert runner._strip_tool_prefix("list_ticket_statuses") == "list_ticket_statuses"
+
+
+def test_strip_prefix_single_segment_plugin():
+    """A single-segment plugin prefix is stripped correctly."""
+    assert runner._strip_tool_prefix("mcp__plugin_my-plugin__do_thing") == "do_thing"
+
+
+def test_strip_prefix_empty_string_unchanged():
+    """An empty string passes through unchanged (no error)."""
+    assert runner._strip_tool_prefix("") == ""
+
+
+def test_strip_prefix_partial_match_unchanged():
+    """A string starting with mcp__ but lacking the closing __ is returned unchanged."""
+    # Has mcp__ prefix but no closing __ after the plugin segment.
+    partial = "mcp__plugin_my-plugin_do_thing"
+    result = runner._strip_tool_prefix(partial)
+    assert result == partial
+
+
+def test_strip_prefix_non_plugin_mcp_name_unchanged():
+    """A tool name that looks like an MCP tool name but lacks the 'plugin_' anchor
+    must NOT be stripped — the regex is now anchored to mcp__plugin_."""
+    name = "mcp__admin__reset_cache"
+    assert runner._strip_tool_prefix(name) == "mcp__admin__reset_cache"
+
+
+# --------------------------------------------------------------------------
+# _exec_step regression and edge tests (mock ClientSession, no real MCP)
+# --------------------------------------------------------------------------
+
+class _FakeCallResult:
+    """Minimal stand-in for an MCP CallToolResult."""
+    def __init__(self, text: str = "", is_error: bool = False):
+        from mcp.types import TextContent
+        self.content = [TextContent(type="text", text=text)]
+        self.isError = is_error
+        self.structuredContent = None
+
+
+class _FakeSession:
+    """Duck-typed ClientSession that records which tool was called."""
+    def __init__(self, result_text: str = '{"ok": true}'):
+        self._result_text = result_text
+        self.called_with: list[tuple[str, dict]] = []
+
+    async def call_tool(self, tool: str, arguments: dict) -> _FakeCallResult:
+        self.called_with.append((tool, arguments))
+        return _FakeCallResult(text=self._result_text)
+
+
+@pytest.mark.anyio
+async def test_exec_step_prefixed_tool_name_matches_bare_toolnames():
+    """Regression: a step whose tool: is a harness-prefixed name must succeed
+    when the server advertises only the bare name."""
+    session = _FakeSession()
+    sessions = {"s": (session, {"my_tool"}, "fake-mcp")}
+    step = {
+        "id": "step1",
+        "server": "s",
+        "tool": "mcp__plugin_x_y__my_tool",
+    }
+    regressions: list[dict[str, Any]] = []
+
+    result = await runner._exec_step(step, sessions, {"RUN_ID": "r1"}, regressions,
+                                     is_teardown=False)
+
+    assert result["status"] == "pass", f"expected pass, got: {result}"
+    assert regressions == [], f"unexpected regressions: {regressions}"
+    # The bare name is what was actually called.
+    assert session.called_with == [("my_tool", {})]
+    # The output tool field is also the bare name.
+    assert result["tool"] == "my_tool"
+
+
+@pytest.mark.anyio
+async def test_exec_step_bare_tool_name_still_matches():
+    """Bare tool names (no prefix) continue to work after the prefix-stripping change."""
+    session = _FakeSession()
+    sessions = {"s": (session, {"my_tool"}, "fake-mcp")}
+    step = {
+        "id": "step1",
+        "server": "s",
+        "tool": "my_tool",
+    }
+    regressions: list[dict[str, Any]] = []
+
+    result = await runner._exec_step(step, sessions, {"RUN_ID": "r1"}, regressions,
+                                     is_teardown=False)
+
+    assert result["status"] == "pass", f"expected pass, got: {result}"
+    assert regressions == []
+
+
+@pytest.mark.anyio
+async def test_exec_step_unknown_tool_still_fails():
+    """A tool name that is neither bare nor prefixed and is absent from toolnames
+    must still produce status=fail with class=contract."""
+    session = _FakeSession()
+    sessions = {"s": (session, {"my_tool"}, "fake-mcp")}
+    step = {
+        "id": "step1",
+        "server": "s",
+        "tool": "completely_unknown_tool",
+    }
+    regressions: list[dict[str, Any]] = []
+
+    result = await runner._exec_step(step, sessions, {"RUN_ID": "r1"}, regressions,
+                                     is_teardown=False)
+
+    assert result["status"] == "fail"
+    assert len(regressions) == 1
+    assert regressions[0]["class"] == "contract"
+
+
+# --------------------------------------------------------------------------
+# dataflow_warnings: prefixed tool name warning
+# --------------------------------------------------------------------------
+
+def test_dataflow_warns_on_prefixed_tool_name():
+    """A suite step with a harness-prefixed tool: name must produce a warning
+    mentioning the step id or the word 'prefix'."""
+    suite = {
+        "schema": 1,
+        "suite": "x / y",
+        "servers": {"s": {"plugin": "p"}},
+        "steps": [
+            {
+                "id": "step_prefixed",
+                "server": "s",
+                "tool": "mcp__plugin_x__do_thing",
+            }
+        ],
+    }
+    warnings = suites.dataflow_warnings(suite)
+    assert warnings, "expected at least one warning for a prefixed tool name"
+    assert any(
+        "step_prefixed" in w or "prefix" in w for w in warnings
+    ), f"expected warning mentioning step id or 'prefix', got: {warnings}"
+
+
+# --------------------------------------------------------------------------
+# Non-string tool: field robustness (fix for ticket #10 blocking finding)
+# --------------------------------------------------------------------------
+
+def test_strip_prefix_non_string_returned_unchanged():
+    """_strip_tool_prefix with a non-string input (e.g. integer 123) must return
+    the value unchanged without raising TypeError."""
+    result = runner._strip_tool_prefix(123)
+    assert result == 123
+
+
+@pytest.mark.anyio
+async def test_exec_step_non_string_tool_fails_gracefully():
+    """A step with tool: 123 (truthy non-string) must return status=fail with
+    class=contract and must NOT raise TypeError."""
+    session = _FakeSession()
+    sessions = {"s": (session, {"real_tool"}, "fake-mcp")}
+    step = {
+        "id": "step_bad_tool",
+        "server": "s",
+        "tool": 123,
+    }
+    regressions: list[dict[str, Any]] = []
+
+    result = await runner._exec_step(step, sessions, {"RUN_ID": "r1"}, regressions,
+                                     is_teardown=False)
+
+    assert result["status"] == "fail", f"expected fail, got: {result}"
+    assert len(regressions) == 1, f"expected one regression, got: {regressions}"
+    assert regressions[0]["class"] == "contract", (
+        f"expected class=contract, got: {regressions[0]['class']!r}"
+    )
+
+
+def test_dataflow_no_crash_on_non_string_tool():
+    """dataflow_warnings on a suite whose step has tool: 123 must return a list
+    (possibly empty) without raising TypeError."""
+    suite = {
+        "schema": 1,
+        "suite": "x / y",
+        "servers": {"s": {"plugin": "p"}},
+        "steps": [
+            {
+                "id": "bad_tool_step",
+                "server": "s",
+                "tool": 123,
+            }
+        ],
+    }
+    result = suites.dataflow_warnings(suite)
+    assert isinstance(result, list)

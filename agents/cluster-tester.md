@@ -150,6 +150,11 @@ responses look like; bake that knowledge into robust assertions so it never has 
 a command, a binary path, an env var, or anything about how the server is launched. You do not know it and
 must not infer it — the orchestrator and the runner own server resolution.
 
+**Tool names in `tool:` fields must be the BARE name** (e.g. `create_ticket`), not the fully-qualified
+harness name from `tool_list` (e.g. `mcp__plugin_agent-project-issues_project-issues__create_ticket`).
+The harness prefix is an artefact of how Claude Code dispatches tools and is stripped at runtime, but
+recording it in the suite degrades readability and triggers a dataflow warning.
+
 Fragment format:
 
 ```
