@@ -95,7 +95,6 @@ def validate_suite(
     if verify_replay:
         rep = anyio.run(_replay, doc, root, overrides or {}, "continue")
         out["verify_replay"] = rep
-        out["valid"] = rep.get("result") == "pass"
     return out
 
 
@@ -205,7 +204,6 @@ async def validate_suite_async(
     if verify_replay:
         rep = await _replay(doc, root, overrides or {}, "continue")
         out["verify_replay"] = rep
-        out["valid"] = rep.get("result") == "pass"
     return out
 
 
@@ -648,7 +646,8 @@ def cli_dispatch(args: Any) -> int:
             print(f"INVALID: {exc}", file=sys.stderr)
             return 1
         print(json.dumps(out, indent=2, default=str))
-        return 0 if out.get("valid") else 1
+        replay_result = out.get("verify_replay", {}).get("result", "pass")
+        return 0 if (out.get("valid") and replay_result == "pass") else 1
 
     if args.cmd == "save":
         text = Path(args.file).read_text(encoding="utf-8")

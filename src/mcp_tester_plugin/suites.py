@@ -168,7 +168,7 @@ def validate(doc: dict[str, Any]) -> None:
     raised, so a recorder can still persist-then-verify."""
     if doc.get("schema") != SCHEMA_VERSION:
         raise SuiteError(
-            f"unsupported schema {doc.get('schema')!r} (expected {SCHEMA_VERSION})"
+            f"suite must have a top-level 'schema: 1' field (got {doc.get('schema')!r})"
         )
     if not doc.get("suite"):
         raise SuiteError("missing 'suite' name")
