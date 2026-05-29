@@ -26,6 +26,37 @@ TARGETS_FILENAME = "targets.yaml"
 # underscore-delimited segments + closing __.
 _TOOL_PREFIX_RE = re.compile(r"^mcp__plugin_[^_][^_]*(?:_[^_][^_]*)*__")
 
+# Mirrors runner._DOUBLE_BRACE_RE: ``{{name}}`` placeholders used in freshly
+# recorded suites before the runner normalises them.  ``dataflow_warnings`` is
+# called on the *raw* doc (pre-normalisation), so we must convert
+# ``{{...}}`` → ``${...}`` here too — otherwise use-before-capture involving
+# double-brace placeholders produces false-clean results.
+_DOUBLE_BRACE_RE = re.compile(r"\{\{([^}]+)\}\}")
+
+
+def _to_dollar_brace(obj: Any) -> Any:
+    """Shallow-normalise ``{{name}}`` → ``${name}`` in *obj* for reference scanning.
+
+    Mirrors the case-preserving rules in ``runner._normalize_placeholders``:
+    - ``env:`` prefix branch preserves the env-var name case.
+    - All other names: strip surrounding whitespace, preserve case.
+    Only strings within dicts and lists are processed; non-string scalars are
+    returned unchanged.  This is intentionally a pure helper for
+    ``dataflow_warnings`` — it does NOT mutate the original doc.
+    """
+    if isinstance(obj, str):
+        def _repl(m: re.Match) -> str:
+            name = m.group(1).strip()
+            if name.lower().startswith("env:"):
+                return "${env:" + name[4:] + "}"
+            return "${" + name + "}"
+        return _DOUBLE_BRACE_RE.sub(_repl, obj)
+    if isinstance(obj, dict):
+        return {k: _to_dollar_brace(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_to_dollar_brace(v) for v in obj]
+    return obj
+
 
 class SuiteError(ValueError):
     """A suite file is structurally invalid."""
@@ -240,14 +271,20 @@ def dataflow_warnings(doc: dict[str, Any]) -> list[str]:
     so the suite is still valid, but recording bare names is preferred.
     """
     warnings: list[str] = []
-    bound: set[str] = {"RUN_ID"}
+    # Both "RUN_ID" (legacy dollar-brace) and "run_id" (normalised double-brace)
+    # are always bound by the runner so neither should produce a dataflow warning.
+    bound: set[str] = {"RUN_ID", "run_id"}
     sandbox = doc.get("sandbox") or {}
     for k in sandbox:
         bound.add(f"sandbox.{k}")
 
     def _check(step: dict[str, Any], where: str, available: set[str]) -> None:
-        for ref in find_references({"args": step.get("args"), "expect": step.get("expect")}):
-            if ref.startswith("env:") or ref.startswith("sandbox.") or ref == "RUN_ID":
+        # Normalise ``{{name}}`` → ``${name}`` before scanning so that
+        # use-before-capture is detected even in raw (pre-runner) docs.
+        raw = {"args": step.get("args"), "expect": step.get("expect")}
+        normalised = _to_dollar_brace(raw)
+        for ref in find_references(normalised):
+            if ref.startswith("env:") or ref.startswith("sandbox.") or ref in ("RUN_ID", "run_id"):
                 continue
             if ref not in available:
                 warnings.append(f"{where}: '${{{ref}}}' used before it is captured")

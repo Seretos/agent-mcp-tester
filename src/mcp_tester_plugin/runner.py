@@ -28,6 +28,49 @@ from mcp.client.stdio import stdio_client
 
 from . import assertions, report, resolve, suites
 
+# --------------------------------------------------------------------------
+# Double-brace placeholder normalisation
+# --------------------------------------------------------------------------
+# Suites recorded by the LLM sweep use ``{{name}}`` (Jinja-style) for
+# placeholders, but ``assertions.substitute`` only expands ``${name}``.
+# Normalise at suite-load time so the rest of the engine is unaffected.
+_DOUBLE_BRACE_RE = re.compile(r"\{\{([^}]+)\}\}")
+
+
+def _normalize_placeholders(obj: Any) -> Any:
+    """Recursively replace ``{{name}}`` with ``${name}`` in strings.
+
+    - Handles nested dicts and lists (same recursion as ``assertions.substitute``).
+    - Non-string scalars (int, bool, None) are returned unchanged.
+    - Already-``${var}`` strings pass through without modification because they
+      contain no ``{{...}}``, so the regex finds nothing.
+    - ``{{env:MY_VAR}}`` → ``${env:MY_VAR}`` (env-var name case is preserved so
+      that ``os.environ.get("MY_VAR")`` works on case-sensitive Linux).
+    - For all names (including non-``env:``), only surrounding whitespace is
+      stripped and the original case is preserved.  ``{{ Run_Id }}`` →
+      ``${Run_Id}``, ``{{ticketId}}`` → ``${ticketId}``.  Capture keys are
+      stored verbatim in ``variables``, so lowercasing would break lookup.
+    - The ``run_id`` / ``RUN_ID`` dual-binding in ``_replay`` already covers the
+      common canonicalisation need — no lowercasing is required here.
+    - Idempotent: calling twice produces the same result.
+    """
+    if isinstance(obj, str):
+        def _repl(m: re.Match) -> str:
+            name = m.group(1).strip()
+            if name.lower().startswith("env:"):
+                # Preserve env-var name case; only normalise the "env:" prefix.
+                # name[4:] is correct because "env:" is exactly 4 chars and
+                # name is already stripped, so the tail is the raw var name.
+                return "${env:" + name[4:] + "}"
+            return "${" + name + "}"
+
+        return _DOUBLE_BRACE_RE.sub(_repl, obj)
+    if isinstance(obj, dict):
+        return {k: _normalize_placeholders(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_normalize_placeholders(v) for v in obj]
+    return obj
+
 
 # --------------------------------------------------------------------------
 # Public entry points (also used by the FastMCP tools in server.py)
@@ -258,7 +301,10 @@ async def _replay(
 ) -> dict[str, Any]:
     started = time.time()
     run_id = _gen_run_id(doc)
-    variables: dict[str, Any] = {"RUN_ID": run_id}
+    # Bind both "RUN_ID" (legacy dollar-brace form used in recorded suites)
+    # and "run_id" (the new double-brace/normalised form) so that both
+    # ${RUN_ID} and ${run_id} (from {{run_id}}) resolve correctly.
+    variables: dict[str, Any] = {"run_id": run_id, "RUN_ID": run_id}
     for k, v in (doc.get("sandbox") or {}).items():
         variables[f"sandbox.{k}"] = v
 
@@ -321,6 +367,7 @@ async def _replay(
         # ---- steps ----
         aborted = False
         for step in doc.get("steps", []):
+            step = _normalize_placeholders(step)
             if aborted:
                 step_results.append({"id": step.get("id"), "status": "skipped",
                                      "reason": "aborted by policy"})
@@ -334,6 +381,7 @@ async def _replay(
 
         # ---- teardown (always) ----
         for step in doc.get("teardown", []) or []:
+            step = _normalize_placeholders(step)
             res = await _exec_step(
                 step, sessions, variables, regressions, is_teardown=True
             )

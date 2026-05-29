@@ -1036,3 +1036,489 @@ def test_cli_dispatch_validate_exits_zero_no_verify_replay(monkeypatch):
     assert exit_code == 0, (
         f"Expected exit code 0 for valid=True + no verify_replay key, got {exit_code}"
     )
+
+
+# --------------------------------------------------------------------------
+# Ticket #16: _normalize_placeholders — double-brace placeholder normalisation
+# --------------------------------------------------------------------------
+
+def test_normalize_placeholders_double_brace_expanded():
+    """``{{run_id}}`` and ``{{ticket_id}}`` must be expanded to ``${run_id}`` /
+    ``${ticket_id}`` in strings, dicts, and lists. Surrounding whitespace is
+    stripped but the original case of the placeholder name is preserved — capture
+    keys are stored verbatim in ``variables`` so lowercasing would break lookup."""
+    # Plain string
+    assert runner._normalize_placeholders("{{run_id}}") == "${run_id}"
+    assert runner._normalize_placeholders("{{ticket_id}}") == "${ticket_id}"
+    # Mixed-case capture variable name → case preserved (NOT lowercased)
+    assert runner._normalize_placeholders("{{ticketId}}") == "${ticketId}"
+    # Uppercase name → case preserved
+    assert runner._normalize_placeholders("{{RUN_ID}}") == "${RUN_ID}"
+    # Whitespace around name → stripped, case preserved
+    assert runner._normalize_placeholders("{{ Run_Id }}") == "${Run_Id}"
+    # Embedded in a longer string
+    assert runner._normalize_placeholders("title-{{run_id}}") == "title-${run_id}"
+    # Dict values are recursed
+    out_dict = runner._normalize_placeholders({"title": "wt-{{run_id}}", "other": 42})
+    assert out_dict == {"title": "wt-${run_id}", "other": 42}
+    # List items are recursed
+    out_list = runner._normalize_placeholders(["{{run_id}}", "{{ticket_id}}", "plain"])
+    assert out_list == ["${run_id}", "${ticket_id}", "plain"]
+
+
+def test_normalize_placeholders_dollar_brace_unchanged():
+    """Existing ``${var}`` strings and non-string scalars must pass through unchanged
+    (idempotence: a string that is already normalised stays the same)."""
+    # Already-dollar-brace strings are untouched (no ``{{...}}`` to match)
+    assert runner._normalize_placeholders("${run_id}") == "${run_id}"
+    assert runner._normalize_placeholders("title ${RUN_ID}") == "title ${RUN_ID}"
+    # Non-string scalars pass through unchanged
+    assert runner._normalize_placeholders(42) == 42
+    assert runner._normalize_placeholders(True) is True
+    assert runner._normalize_placeholders(None) is None
+    # Idempotence: calling twice gives same result
+    result = runner._normalize_placeholders("{{run_id}}")
+    assert runner._normalize_placeholders(result) == result
+
+
+# --------------------------------------------------------------------------
+# Ticket #16: _exec_step with double-brace placeholders (after normalisation)
+# --------------------------------------------------------------------------
+
+@pytest.mark.anyio
+async def test_exec_step_double_brace_run_id_substituted():
+    """``_exec_step`` with args containing ``{{run_id}}`` must dispatch
+    the resolved value after ``_normalize_placeholders`` is applied first
+    (mirroring the ``_replay`` flow which normalises before calling ``_exec_step``).
+    """
+    session = _FakeSession(result_text='{"ok": true}')
+    sessions = {"s": (session, {"create_ticket"}, "fake-mcp")}
+    raw_step = {
+        "id": "create",
+        "server": "s",
+        "tool": "create_ticket",
+        "args": {"title": "wt-{{run_id}}"},
+    }
+    # Normalise first, as _replay does.
+    step = runner._normalize_placeholders(raw_step)
+    variables = {"run_id": "e2e-test-1"}
+    regressions: list[dict[str, Any]] = []
+
+    result = await runner._exec_step(step, sessions, variables, regressions,
+                                     is_teardown=False)
+
+    assert result["status"] == "pass", f"expected pass, got: {result}"
+    assert regressions == [], f"unexpected regressions: {regressions}"
+    # The resolved value must have been dispatched to the session.
+    assert session.called_with == [("create_ticket", {"title": "wt-e2e-test-1"})]
+
+
+@pytest.mark.anyio
+async def test_exec_step_double_brace_assertion_value_substituted():
+    """An assertion ``value`` containing ``{{run_id}}`` must be resolved (via
+    normalisation → substitution) before comparison so an ``equals`` check against
+    the real captured value passes instead of false-failing."""
+    # The tool returns a result whose title matches the resolved run_id value.
+    session = _FakeSession(result_text='{"title": "wt-e2e-test-1"}')
+    sessions = {"s": (session, {"create_ticket"}, "fake-mcp")}
+    raw_step = {
+        "id": "create",
+        "server": "s",
+        "tool": "create_ticket",
+        "args": {},
+        "expect": [
+            {"path": "$.title", "op": "equals", "value": "wt-{{run_id}}"}
+        ],
+    }
+    # Normalise first, as _replay does.
+    step = runner._normalize_placeholders(raw_step)
+    variables = {"run_id": "e2e-test-1"}
+    regressions: list[dict[str, Any]] = []
+
+    result = await runner._exec_step(step, sessions, variables, regressions,
+                                     is_teardown=False)
+
+    assert result["status"] == "pass", f"expected pass, got: {result}"
+    # All assertions must be ok.
+    assert all(a["ok"] for a in result.get("assertions", [])), (
+        f"expected all assertions ok, got: {result.get('assertions')}"
+    )
+
+
+@pytest.mark.anyio
+async def test_exec_step_double_brace_captured_var_in_next_step():
+    """A first step captures ``ticket_id``; a later step uses ``{{ticket_id}}``
+    in its args. After normalisation + substitution the later step receives the
+    captured value rather than the literal ``{{ticket_id}}``."""
+    # Step 1: capture ticket_id from the result.
+    session1 = _FakeSession(result_text='{"id": 99, "_isError": false}')
+    sessions = {"s": (session1, {"create_ticket", "get_ticket"}, "fake-mcp")}
+
+    step1_raw = {
+        "id": "create",
+        "server": "s",
+        "tool": "create_ticket",
+        "args": {},
+        "capture": {"ticket_id": "$.id"},
+    }
+    step1 = runner._normalize_placeholders(step1_raw)
+    variables: dict[str, Any] = {"run_id": "e2e-test-2"}
+    regressions: list[dict[str, Any]] = []
+
+    res1 = await runner._exec_step(step1, sessions, variables, regressions,
+                                   is_teardown=False)
+    assert res1["status"] == "pass", f"step1 failed: {res1}"
+    # Captured value must be in variables now.
+    assert variables.get("ticket_id") == 99
+
+    # Step 2: use {{ticket_id}} in args; normalise before calling _exec_step.
+    step2_raw = {
+        "id": "read",
+        "server": "s",
+        "tool": "get_ticket",
+        "args": {"id": "{{ticket_id}}"},
+    }
+    step2 = runner._normalize_placeholders(step2_raw)
+    # After normalisation, "{{ticket_id}}" → "${ticket_id}"
+    assert step2["args"]["id"] == "${ticket_id}"
+
+    res2 = await runner._exec_step(step2, sessions, variables, regressions,
+                                   is_teardown=False)
+    assert res2["status"] == "pass", f"step2 failed: {res2}"
+    # The resolved integer must have been dispatched.
+    assert session1.called_with[-1] == ("get_ticket", {"id": 99})
+
+
+# --------------------------------------------------------------------------
+# Ticket #16: run_suite MCP tool returns structured error dict on exception
+# --------------------------------------------------------------------------
+
+@pytest.mark.anyio
+async def test_run_suite_mcp_tool_returns_error_dict_on_exception(monkeypatch):
+    """Monkeypatching ``runner.run_async`` to raise RuntimeError must result in
+    ``run_suite`` returning a dict with ``result="error"`` and an ``error`` key
+    rather than propagating the exception."""
+    import importlib
+    from mcp_tester_plugin import server
+
+    # Import runner so we can monkeypatch it.
+    from mcp_tester_plugin import runner as _runner
+
+    async def boom(suite, *, policy, **kwargs):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(_runner, "run_async", boom)
+
+    # Call the underlying function directly (bypass FastMCP's tool wrapper).
+    # server.run_suite is the decorated async function — call it by name.
+    result = await server.run_suite("test__minimal", policy="continue")
+
+    assert isinstance(result, dict), f"expected dict, got {type(result)}: {result!r}"
+    assert result.get("result") == "error", f"expected result='error', got: {result}"
+    assert "error" in result, f"expected 'error' key in result, got: {result}"
+    assert "RuntimeError" in result["error"], (
+        f"expected 'RuntimeError' in error string, got: {result['error']!r}"
+    )
+    assert "boom" in result["error"], (
+        f"expected 'boom' in error string, got: {result['error']!r}"
+    )
+    assert "regressions" in result, f"expected 'regressions' key, got: {result}"
+
+
+# --------------------------------------------------------------------------
+# Ticket #16 review fix B1: legacy ${RUN_ID} resolves in the real variables table
+# --------------------------------------------------------------------------
+
+@pytest.mark.anyio
+async def test_exec_step_legacy_RUN_ID_resolves():
+    """Regression: a step using the legacy ``${RUN_ID}`` dollar-brace form must
+    still resolve after normalisation because ``_replay`` binds BOTH ``run_id``
+    and ``RUN_ID`` in the variables table.
+
+    Reproduces the breakage: if only ``run_id`` is bound, ``${RUN_ID}`` raises
+    ``UnresolvedVariable``, turning every pre-existing recorded suite into a fail.
+    """
+    session = _FakeSession(result_text='{"ok": true}')
+    sessions = {"s": (session, {"create_ticket"}, "fake-mcp")}
+    raw_step = {
+        "id": "create",
+        "server": "s",
+        "tool": "create_ticket",
+        # Legacy dollar-brace form: passes through _normalize_placeholders unchanged.
+        "args": {"title": "wt-${RUN_ID}"},
+    }
+    # Normalise as _replay does — the dollar-brace form must be left intact.
+    step = runner._normalize_placeholders(raw_step)
+    assert step["args"]["title"] == "wt-${RUN_ID}", (
+        "normalisation must not alter existing ${RUN_ID} references"
+    )
+
+    # Build the variables table exactly as _replay does (both keys bound).
+    run_id = "e2e-test-legacy"
+    variables: dict[str, Any] = {"run_id": run_id, "RUN_ID": run_id}
+    regressions: list[dict[str, Any]] = []
+
+    result = await runner._exec_step(step, sessions, variables, regressions,
+                                     is_teardown=False)
+
+    assert result["status"] == "pass", (
+        f"legacy ${{RUN_ID}} must resolve; got status={result['status']!r}, "
+        f"error={result.get('error')!r}"
+    )
+    assert regressions == [], f"unexpected regressions: {regressions}"
+    # The resolved value must have been dispatched.
+    assert session.called_with == [("create_ticket", {"title": f"wt-{run_id}"})]
+
+
+# --------------------------------------------------------------------------
+# Ticket #16 review fix B2: {{env:MY_VAR}} preserves env-var name case
+# --------------------------------------------------------------------------
+
+def test_normalize_placeholders_env_var_case_preserved():
+    """``{{env:MY_VAR}}`` must normalise to ``${env:MY_VAR}`` (uppercase preserved).
+
+    Lowercasing the env-var name breaks lookup on Linux where ``os.environ``
+    is case-sensitive: ``os.environ.get("my_var")`` misses ``MY_VAR``.
+    """
+    assert runner._normalize_placeholders("{{env:MY_VAR}}") == "${env:MY_VAR}"
+    assert runner._normalize_placeholders("{{env:GITHUB_TOKEN}}") == "${env:GITHUB_TOKEN}"
+    # Mixed case is also preserved.
+    assert runner._normalize_placeholders("{{env:My_Var}}") == "${env:My_Var}"
+    # Whitespace around the whole name is stripped, but var-name case is kept.
+    assert runner._normalize_placeholders("{{ env:MY_VAR }}") == "${env:MY_VAR}"
+    # Embedding in a longer string.
+    assert runner._normalize_placeholders("token-{{env:API_TOKEN}}") == "token-${env:API_TOKEN}"
+
+
+def test_normalize_placeholders_env_var_resolves_correctly(monkeypatch):
+    """End-to-end: ``{{env:MY_VAR}}`` normalises and then resolves via
+    ``assertions.substitute`` against the real environment (monkeypatched).
+
+    Confirms both the normalisation (case-preserving) and the lookup path
+    (``assertions._lookup`` uses ``os.environ.get(name[4:])``).
+    """
+    monkeypatch.setenv("MCP_TESTER_UPPER_TEST_VAR", "resolved_value")
+    # Normalise the double-brace form.
+    normalised = runner._normalize_placeholders("prefix-{{env:MCP_TESTER_UPPER_TEST_VAR}}")
+    assert normalised == "prefix-${env:MCP_TESTER_UPPER_TEST_VAR}"
+    # Substitute via the real assertions path (no variables dict needed for env refs).
+    result = assertions.substitute(normalised, {})
+    assert result == "prefix-resolved_value"
+
+
+# --------------------------------------------------------------------------
+# Ticket #16 review nit: error dict from run_suite has all human_summary keys
+# --------------------------------------------------------------------------
+
+@pytest.mark.anyio
+async def test_run_suite_error_dict_is_human_summary_safe(monkeypatch):
+    """The error dict returned by ``run_suite`` on exception must contain at
+    minimum the keys that ``report.human_summary`` reads: ``run_id``,
+    ``counts``, ``servers``.  Missing keys cause a KeyError / AttributeError
+    when the CLI's ``run`` command calls ``human_summary(rep)``.
+    """
+    from mcp_tester_plugin import report as _report
+    from mcp_tester_plugin import runner as _runner
+    from mcp_tester_plugin import server
+
+    async def boom(suite, *, policy, **kwargs):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(_runner, "run_async", boom)
+
+    result = await server.run_suite("test__minimal", policy="continue")
+
+    # human_summary must not raise.
+    summary = _report.human_summary(result)
+    assert isinstance(summary, str)
+    # The minimal keys must be present.
+    assert "run_id" in result
+    assert "counts" in result
+    assert "servers" in result
+
+
+# --------------------------------------------------------------------------
+# Ticket #16 review: dataflow_warnings does not warn on "run_id" reference
+# --------------------------------------------------------------------------
+
+def test_dataflow_no_warning_for_run_id_lowercase():
+    """A suite step referencing ``${run_id}`` (the normalised double-brace form)
+    must NOT produce a dataflow warning — the runner always binds this key."""
+    suite = {
+        "schema": 1,
+        "suite": "x / y",
+        "servers": {"s": {"plugin": "p"}},
+        "steps": [
+            {
+                "id": "step1",
+                "server": "s",
+                "tool": "create_ticket",
+                "args": {"title": "wt-${run_id}"},
+            }
+        ],
+    }
+    warnings = suites.dataflow_warnings(suite)
+    assert not any("run_id" in w for w in warnings), (
+        f"Expected no warning for ${{run_id}}, got: {warnings}"
+    )
+
+
+# --------------------------------------------------------------------------
+# Ticket #16 re-review [blocking A]: _normalize_placeholders must NOT lowercase
+# user-defined variable names — case is preserved for capture key lookups.
+# --------------------------------------------------------------------------
+
+def test_normalize_placeholders_mixed_case_capture_key_preserved():
+    """Regression: ``{{ticketId}}`` must normalise to ``${ticketId}`` (not ``${ticketid}``).
+
+    Capture keys are stored verbatim in ``variables`` (e.g.
+    ``capture: {ticketId: "$.id"}`` stores ``variables["ticketId"]``).  If
+    normalisation lowercases the name, a later ``{{ticketId}}`` would become
+    ``${ticketid}`` which finds no binding and raises ``UnresolvedVariable``.
+    """
+    assert runner._normalize_placeholders("{{ticketId}}") == "${ticketId}"
+    assert runner._normalize_placeholders("{{MyCapture}}") == "${MyCapture}"
+    assert runner._normalize_placeholders("{{TICKET_ID}}") == "${TICKET_ID}"
+    # Whitespace stripped but case preserved.
+    assert runner._normalize_placeholders("{{ TicketId }}") == "${TicketId}"
+
+
+@pytest.mark.anyio
+async def test_exec_step_mixed_case_capture_key_resolves():
+    """Regression: a step that captures into a mixed-case key (``ticketId``) and a
+    later step using ``{{ticketId}}`` must succeed end-to-end after normalisation.
+
+    Before the fix, normalisation lowercased ``ticketId`` → ``ticketid``, but
+    ``variables`` held ``ticketId``, causing ``UnresolvedVariable``.
+    """
+    session = _FakeSession(result_text='{"id": 42, "_isError": false}')
+    sessions = {"s": (session, {"create_ticket", "get_ticket"}, "fake-mcp")}
+
+    # Step 1: capture into mixed-case key.
+    step1_raw = {
+        "id": "create",
+        "server": "s",
+        "tool": "create_ticket",
+        "args": {},
+        "capture": {"ticketId": "$.id"},
+    }
+    step1 = runner._normalize_placeholders(step1_raw)
+    variables: dict[str, Any] = {"run_id": "r1", "RUN_ID": "r1"}
+    regressions: list[dict[str, Any]] = []
+
+    res1 = await runner._exec_step(step1, sessions, variables, regressions, is_teardown=False)
+    assert res1["status"] == "pass", f"step1 failed: {res1}"
+    assert variables.get("ticketId") == 42, "ticketId must be captured verbatim"
+
+    # Step 2: reference via double-brace with the same mixed case.
+    step2_raw = {
+        "id": "read",
+        "server": "s",
+        "tool": "get_ticket",
+        "args": {"id": "{{ticketId}}"},  # must normalise to ${ticketId}, NOT ${ticketid}
+    }
+    step2 = runner._normalize_placeholders(step2_raw)
+    assert step2["args"]["id"] == "${ticketId}", (
+        f"normalisation must preserve case: got {step2['args']['id']!r}"
+    )
+
+    res2 = await runner._exec_step(step2, sessions, variables, regressions, is_teardown=False)
+    assert res2["status"] == "pass", (
+        f"step2 failed (unresolved variable?): status={res2['status']!r}, "
+        f"error={res2.get('error')!r}"
+    )
+    assert session.called_with[-1] == ("get_ticket", {"id": 42})
+
+
+# --------------------------------------------------------------------------
+# Ticket #16 re-review [blocking B]: dataflow_warnings detects {{...}} placeholders
+# in raw (pre-normalisation) docs — use-before-capture must not be silently missed.
+# --------------------------------------------------------------------------
+
+def test_dataflow_warns_on_double_brace_use_before_capture():
+    """Regression: a suite using ``{{ticket_id}}`` BEFORE it is captured must produce
+    a use-before-capture dataflow warning even though the raw doc contains the
+    double-brace form (not the ``${...}`` form that ``find_references`` detects).
+
+    Before the fix, ``dataflow_warnings`` called ``find_references`` on the raw doc
+    and ``{{ticket_id}}`` produced zero references, giving a false clean result.
+    """
+    suite = {
+        "schema": 1,
+        "suite": "x / y",
+        "servers": {"s": {"plugin": "p"}},
+        "steps": [
+            # step1 uses ticket_id before it is captured (use-before-capture).
+            {
+                "id": "step1",
+                "server": "s",
+                "tool": "get_ticket",
+                "args": {"id": "{{ticket_id}}"},  # double-brace, not yet normalised
+            },
+            # step2 captures ticket_id — but it's too late for step1.
+            {
+                "id": "step2",
+                "server": "s",
+                "tool": "create_ticket",
+                "args": {},
+                "capture": {"ticket_id": "$.id"},
+            },
+        ],
+    }
+    warnings = suites.dataflow_warnings(suite)
+    assert any("ticket_id" in w for w in warnings), (
+        f"Expected a use-before-capture warning for ticket_id, got: {warnings}"
+    )
+
+
+def test_dataflow_no_warning_double_brace_after_capture():
+    """A suite using ``{{ticket_id}}`` AFTER it is captured must NOT produce a
+    dataflow warning — the reference is legitimately available."""
+    suite = {
+        "schema": 1,
+        "suite": "x / y",
+        "servers": {"s": {"plugin": "p"}},
+        "steps": [
+            {
+                "id": "step1",
+                "server": "s",
+                "tool": "create_ticket",
+                "args": {},
+                "capture": {"ticket_id": "$.id"},
+            },
+            # step2 uses ticket_id after it is captured — must be clean.
+            {
+                "id": "step2",
+                "server": "s",
+                "tool": "get_ticket",
+                "args": {"id": "{{ticket_id}}"},  # double-brace form, legitimately bound
+            },
+        ],
+    }
+    warnings = [w for w in suites.dataflow_warnings(suite) if "ticket_id" in w]
+    assert warnings == [], (
+        f"Expected no dataflow warning for ticket_id used after capture, got: {warnings}"
+    )
+
+
+def test_dataflow_no_warning_for_double_brace_run_id():
+    """``{{run_id}}`` (double-brace) must NOT produce a dataflow warning — the runner
+    always binds both ``run_id`` and ``RUN_ID``.  The normalisation inside
+    ``dataflow_warnings`` must not accidentally treat ``run_id`` as unbound."""
+    suite = {
+        "schema": 1,
+        "suite": "x / y",
+        "servers": {"s": {"plugin": "p"}},
+        "steps": [
+            {
+                "id": "step1",
+                "server": "s",
+                "tool": "create_ticket",
+                "args": {"title": "wt-{{run_id}}"},  # double-brace run_id
+            }
+        ],
+    }
+    warnings = suites.dataflow_warnings(suite)
+    assert not any("run_id" in w for w in warnings), (
+        f"Expected no warning for {{{{run_id}}}}, got: {warnings}"
+    )
