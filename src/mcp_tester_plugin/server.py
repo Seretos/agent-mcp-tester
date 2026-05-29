@@ -41,7 +41,18 @@ async def run_suite(suite: str, policy: str = "continue") -> dict:
     """
     from . import runner
 
-    return await runner.run_async(suite, policy=policy)
+    try:
+        return await runner.run_async(suite, policy=policy)
+    except Exception as exc:  # noqa: BLE001
+        return {
+            "result": "error",
+            "error": f"{type(exc).__name__}: {exc}",
+            "suite": suite,
+            "run_id": None,
+            "counts": {},
+            "servers": [],
+            "regressions": [],
+        }
 
 
 @mcp.tool()
