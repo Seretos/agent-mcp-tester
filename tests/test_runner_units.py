@@ -459,8 +459,9 @@ async def test_validate_suite_async_inline_yaml_invalid_schema(monkeypatch, tmp_
     # schema: 99 with no suite/servers/steps — structurally invalid.
     bad_yaml = "schema: 99\n"
 
-    with pytest.raises(suites.SuiteError):
+    with pytest.raises(suites.SuiteError) as exc_info:
         await runner.validate_suite_async(bad_yaml, verify_replay=False)
+    assert "schema: 1" in str(exc_info.value)
 
 
 @pytest.mark.anyio
@@ -841,3 +842,197 @@ def test_dataflow_no_crash_on_non_string_tool():
     }
     result = suites.dataflow_warnings(suite)
     assert isinstance(result, list)
+
+
+# --------------------------------------------------------------------------
+# Ticket #12: validate_suite UX fixes — schema error message & valid semantics
+# --------------------------------------------------------------------------
+
+def test_suite_validate_missing_schema_error_message():
+    """suites.validate({suite: x}) with no schema field must raise SuiteError
+    whose message contains the literal string 'schema: 1'."""
+    with pytest.raises(suites.SuiteError) as exc_info:
+        suites.validate({"suite": "x"})
+    assert "schema: 1" in str(exc_info.value), (
+        f"Expected 'schema: 1' in error message, got: {exc_info.value!r}"
+    )
+
+
+def test_suite_validate_wrong_schema_version_error_message():
+    """suites.validate with schema: 99 must raise SuiteError whose message
+    contains both 'schema: 1' and the offending value '99'."""
+    with pytest.raises(suites.SuiteError) as exc_info:
+        suites.validate({"schema": 99})
+    msg = str(exc_info.value)
+    assert "schema: 1" in msg, (
+        f"Expected 'schema: 1' in error message, got: {msg!r}"
+    )
+    assert "99" in msg, (
+        f"Expected offending value '99' in error message, got: {msg!r}"
+    )
+
+
+@pytest.mark.anyio
+async def test_validate_suite_async_valid_survives_replay_failure(monkeypatch, tmp_path):
+    """Regression: valid=True must survive when replay fails.
+
+    A structurally valid suite must return valid=True even when the replay
+    returns result='regression'. The replay outcome lives exclusively under
+    the verify_replay key and does not overwrite the schema-validity signal.
+    """
+    async def stub_replay(*_args, **_kwargs) -> dict[str, Any]:
+        return dict(STUB_FAIL_REPORT)
+
+    monkeypatch.setattr(runner, "_replay", stub_replay)
+    _make_suite_file(tmp_path)
+    monkeypatch.setenv("MCP_TESTER_ROOT", str(tmp_path))
+
+    result = await runner.validate_suite_async("test__minimal", verify_replay=True)
+
+    assert result["valid"] is True, (
+        f"valid must be True for a structurally valid suite, got: {result['valid']!r}"
+    )
+    assert "verify_replay" in result
+    assert result["verify_replay"]["result"] == "regression", (
+        f"replay result must be 'regression', got: {result['verify_replay']['result']!r}"
+    )
+
+
+@pytest.mark.anyio
+async def test_validate_suite_async_inline_valid_survives_replay_failure(monkeypatch, tmp_path):
+    """Regression (inline-YAML branch): valid=True must survive when replay fails.
+
+    Same invariant as the file-path variant but exercises the inline-YAML
+    code path (no mcp-suites/ dir so resolve_suite_path raises SuiteError).
+    """
+    async def stub_replay(*_args, **_kwargs) -> dict[str, Any]:
+        return dict(STUB_FAIL_REPORT)
+
+    monkeypatch.setattr(runner, "_replay", stub_replay)
+    monkeypatch.setenv("MCP_TESTER_ROOT", str(tmp_path))
+    # Deliberately do NOT create mcp-suites/ so the inline branch is taken.
+
+    result = await runner.validate_suite_async(MINIMAL_SUITE_YAML, verify_replay=True)
+
+    assert result["valid"] is True, (
+        f"valid must be True for a structurally valid suite (inline), got: {result['valid']!r}"
+    )
+    assert result.get("inline") is True
+    assert "verify_replay" in result
+    assert result["verify_replay"]["result"] == "regression", (
+        f"replay result must be 'regression', got: {result['verify_replay']['result']!r}"
+    )
+
+
+def test_sync_validate_suite_valid_survives_replay_failure(monkeypatch, tmp_path):
+    """Sync validate_suite: valid=True must survive when replay fails.
+
+    Exercises the sync twin of the async function. Uses monkeypatch to stub
+    anyio.run so no event loop is needed.
+    """
+    monkeypatch.setattr(runner, "_replay", None)  # replaced by anyio.run stub below
+
+    def fake_anyio_run(coro_func, *args, **kwargs):
+        # anyio.run(coro_func, ...) — return the fail report
+        return dict(STUB_FAIL_REPORT)
+
+    import anyio as _anyio
+    monkeypatch.setattr(_anyio, "run", fake_anyio_run)
+
+    _make_suite_file(tmp_path)
+    monkeypatch.setenv("MCP_TESTER_ROOT", str(tmp_path))
+
+    result = runner.validate_suite("test__minimal", verify_replay=True)
+
+    assert result["valid"] is True, (
+        f"valid must be True for a structurally valid suite (sync), got: {result['valid']!r}"
+    )
+    assert "verify_replay" in result
+    assert result["verify_replay"]["result"] == "regression"
+
+
+# --------------------------------------------------------------------------
+# Ticket #12: cli_dispatch validate exit-code honours replay result
+# --------------------------------------------------------------------------
+
+import argparse as _argparse
+
+
+def test_cli_dispatch_validate_exits_nonzero_on_replay_failure(monkeypatch):
+    """cli_dispatch validate must return 1 when the suite is structurally valid
+    but the verify-replay result is not 'pass' (e.g. 'regression').
+
+    This pins the behavioral fix: previously the exit code was determined solely
+    by out.get("valid"), so a valid suite with a failing replay would exit 0.
+    The fixed logic also checks verify_replay.result and exits 1 on any non-pass
+    replay outcome.
+    """
+    stub_out = {"valid": True, "verify_replay": {"result": "regression"}}
+
+    def fake_validate_suite(suite, *, verify_replay, overrides):
+        return stub_out
+
+    monkeypatch.setattr(runner, "validate_suite", fake_validate_suite)
+
+    args = _argparse.Namespace(
+        cmd="validate",
+        suite="test__minimal",
+        no_replay=False,
+        server=[],
+    )
+    exit_code = runner.cli_dispatch(args)
+
+    assert exit_code == 1, (
+        f"Expected exit code 1 for valid=True + replay result='regression', got {exit_code}"
+    )
+
+
+def test_cli_dispatch_validate_exits_zero_on_replay_pass(monkeypatch):
+    """cli_dispatch validate must return 0 when the suite is structurally valid
+    and the verify-replay result is 'pass'.
+    """
+    stub_out = {"valid": True, "verify_replay": {"result": "pass"}}
+
+    def fake_validate_suite(suite, *, verify_replay, overrides):
+        return stub_out
+
+    monkeypatch.setattr(runner, "validate_suite", fake_validate_suite)
+
+    args = _argparse.Namespace(
+        cmd="validate",
+        suite="test__minimal",
+        no_replay=False,
+        server=[],
+    )
+    exit_code = runner.cli_dispatch(args)
+
+    assert exit_code == 0, (
+        f"Expected exit code 0 for valid=True + replay result='pass', got {exit_code}"
+    )
+
+
+def test_cli_dispatch_validate_exits_zero_no_verify_replay(monkeypatch):
+    """cli_dispatch validate must return 0 when the suite is valid and verify_replay
+    is absent from the output (--no-replay flag: no replay was run).
+
+    When verify_replay is missing, out.get("verify_replay", {}).get("result", "pass")
+    defaults to "pass", so exit code must be 0.
+    """
+    stub_out = {"valid": True}
+
+    def fake_validate_suite(suite, *, verify_replay, overrides):
+        return stub_out
+
+    monkeypatch.setattr(runner, "validate_suite", fake_validate_suite)
+
+    args = _argparse.Namespace(
+        cmd="validate",
+        suite="test__minimal",
+        no_replay=True,
+        server=[],
+    )
+    exit_code = runner.cli_dispatch(args)
+
+    assert exit_code == 0, (
+        f"Expected exit code 0 for valid=True + no verify_replay key, got {exit_code}"
+    )

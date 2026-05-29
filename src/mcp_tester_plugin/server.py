@@ -61,12 +61,17 @@ async def validate_suite(suite: str, verify_replay: bool = True) -> dict:
     - raw YAML text of a suite document (write-free schema check, useful for
       validating a draft before calling save_suite).
 
+    A valid suite document must include a top-level ``schema: 1`` field.
+    Omitting it or using any other value will raise a validation error.
+
     If `verify_replay` is True (default), the suite is also replayed once
     against the live MCP to confirm its assertions hold.
 
-    Returns a dict with `valid` (bool) and `dataflow_warnings`. When loaded
-    from a file, `suite_file` is included. When parsed from inline YAML,
-    `inline: true` is included instead and no file is written.
+    Returns a dict with `valid` (bool, reflects schema validity only) and
+    `dataflow_warnings`. When loaded from a file, `suite_file` is included.
+    When parsed from inline YAML, `inline: true` is included instead and no
+    file is written. When `verify_replay` is True, a `verify_replay` key
+    contains the replay report; replay pass/fail does NOT affect `valid`.
     """
     from . import runner
 
@@ -76,6 +81,9 @@ async def validate_suite(suite: str, verify_replay: bool = True) -> dict:
 @mcp.tool()
 async def save_suite(suite_yaml: str, verify_replay: bool = True, filename: str = "") -> dict:
     """Persist a recorded suite (YAML text) into mcp-suites/.
+
+    The suite YAML must include a top-level ``schema: 1`` field; omitting it
+    or using any other value will cause validation to fail before saving.
 
     With verify_replay on (default), the suite is replayed once before being
     written; if the replay does not pass, the suite is NOT saved and the failing
