@@ -110,7 +110,10 @@ def jsonpath_all(path: str, data: Any) -> list[Any]:
         expr = _jsonpath_parse(path)
     except Exception as exc:  # noqa: BLE001 - surface a clean message
         raise ValueError(f"invalid JSONPath {path!r}: {exc}") from exc
-    return [m.value for m in expr.find(data)]
+    try:
+        return [m.value for m in expr.find(data)]
+    except (KeyError, IndexError, TypeError):
+        return []
 
 
 def extract_one(path: str, data: Any) -> tuple[bool, Any]:
