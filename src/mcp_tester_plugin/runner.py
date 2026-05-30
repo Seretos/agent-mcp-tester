@@ -611,15 +611,16 @@ async def _exec_step(
     # Call the tool.
     try:
         result = await session.call_tool(tool, arguments=args)
-    except Exception as exc:  # noqa: BLE001
+    except BaseException as exc:  # noqa: BLE001
+        _reraise_if_fatal(exc)
         out["status"] = "fail"
-        out["error"] = f"{type(exc).__name__}: {exc}"
+        out["error"] = _format_exc(exc)
         if is_teardown:
             out["teardown_note"] = f"{sid}: call failed ({exc})"
             return out
         regressions.append(report.make_regression(
             step_id=sid, server=logical, mcp=mcp_name, tool=tool, cls="harness",
-            observed=f"call raised {type(exc).__name__}: {exc}",
+            observed=f"call raised {_format_exc(exc)}",
             expected="tool call returns a result",
             repro=report.repro_string(tool, args), severity="med"))
         return out

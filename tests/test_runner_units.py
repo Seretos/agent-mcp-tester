@@ -2602,3 +2602,92 @@ async def test_exec_step_is_error_no_expect_classified_behavioural():
     assert regressions[0]["routing"] == "behaviour", (
         f"expected routing=behaviour for behavioural class, got: {regressions[0]['routing']!r}"
     )
+
+
+# --------------------------------------------------------------------------
+# Ticket #22: BaseExceptionGroup from call_tool must be caught per-step,
+# not escape to the outer _replay handler.
+# --------------------------------------------------------------------------
+
+class _RaisingSession:
+    """Duck-typed session whose call_tool raises the configured exception."""
+    def __init__(self, exc: BaseException):
+        self._exc = exc
+
+    async def call_tool(self, tool: str, arguments: dict) -> None:
+        raise self._exc
+
+
+@pytest.mark.anyio
+async def test_exec_step_base_exception_group_recorded_as_fail():
+    """Regression (#22): BaseExceptionGroup from call_tool must be caught per-step
+    and recorded as status='fail' with the inner message in 'error', and exactly
+    one harness regression appended.  Must not re-raise.
+
+    Before the fix, `except Exception` in _exec_step let BaseExceptionGroup
+    escape to the outer _replay handler, discarding remaining steps and producing
+    an opaque result='error' report.
+    """
+    exc = BaseExceptionGroup("transport error", [RuntimeError("connection reset")])
+    session = _RaisingSession(exc)
+    sessions = {"s": (session, {"fake_tool"}, "fake-mcp")}
+    step = {"id": "step1", "server": "s", "tool": "fake_tool"}
+    regressions: list[dict[str, Any]] = []
+
+    result = await runner._exec_step(step, sessions, {"RUN_ID": "r1"}, regressions,
+                                     is_teardown=False)
+
+    assert result["status"] == "fail", f"expected fail, got: {result}"
+    assert "connection reset" in result.get("error", ""), (
+        f"inner exception message must appear in error: {result.get('error')!r}"
+    )
+    assert len(regressions) == 1, f"expected one regression, got: {regressions}"
+    assert regressions[0]["class"] == "harness", (
+        f"expected class=harness for call_tool raise, got: {regressions[0]['class']!r}"
+    )
+
+
+@pytest.mark.anyio
+async def test_exec_step_base_exception_group_teardown_recorded_as_fail():
+    """Regression (#22): BaseExceptionGroup from call_tool during teardown must be
+    caught per-step, set status='fail', populate teardown_note with the step id,
+    and NOT append a regression (teardown failures are notes, not regressions).
+    """
+    exc = BaseExceptionGroup("transport error", [RuntimeError("connection reset")])
+    session = _RaisingSession(exc)
+    sessions = {"s": (session, {"fake_tool"}, "fake-mcp")}
+    step = {"id": "teardown1", "server": "s", "tool": "fake_tool"}
+    regressions: list[dict[str, Any]] = []
+
+    result = await runner._exec_step(step, sessions, {"RUN_ID": "r1"}, regressions,
+                                     is_teardown=True)
+
+    assert result["status"] == "fail", f"expected fail, got: {result}"
+    note = result.get("teardown_note", "")
+    assert "teardown1" in note, (
+        f"teardown_note must contain the step id 'teardown1': {note!r}"
+    )
+    assert regressions == [], (
+        f"teardown failures must not append regressions, got: {regressions}"
+    )
+
+
+@pytest.mark.anyio
+async def test_exec_step_cancelled_error_group_reraises():
+    """Regression (#22): BaseExceptionGroup wrapping CancelledError raised by
+    call_tool must be re-raised by _exec_step (via _reraise_if_fatal), not
+    swallowed into a structured-error dict.
+
+    This confirms the _reraise_if_fatal call is made before the error-dict path.
+    """
+    import asyncio
+
+    exc = BaseExceptionGroup("cancel", [asyncio.CancelledError()])
+    session = _RaisingSession(exc)
+    sessions = {"s": (session, {"fake_tool"}, "fake-mcp")}
+    step = {"id": "step1", "server": "s", "tool": "fake_tool"}
+    regressions: list[dict[str, Any]] = []
+
+    with pytest.raises(BaseExceptionGroup):
+        await runner._exec_step(step, sessions, {"RUN_ID": "r1"}, regressions,
+                                is_teardown=False)
