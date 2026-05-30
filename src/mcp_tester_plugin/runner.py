@@ -663,8 +663,18 @@ async def _exec_step(
             f"{a.get('path')} {a.get('op')} {a.get('value', '')}".strip()
             for a in failed
         )
+        # If every failed assertion is a "path did not resolve" error the
+        # root cause is a wrong JSONPath in the suite (suite-authoring defect),
+        # not a behavioural regression in the MCP under test.
+        # Guard: an empty failed list (e.g. is_error with no expect entries)
+        # must NOT be treated as "all path misses" — that would mislabel an
+        # is_error/no-expect failure as class="harness" instead of "behavioural".
+        all_path_miss = bool(failed) and all(
+            a.get("error") == "path did not resolve" for a in failed
+        )
+        assertion_cls = "harness" if all_path_miss else "behavioural"
         regressions.append(report.make_regression(
-            step_id=sid, server=logical, mcp=mcp_name, tool=tool, cls="behavioural",
+            step_id=sid, server=logical, mcp=mcp_name, tool=tool, cls=assertion_cls,
             observed=observed, expected=expected or "assertions hold",
             repro=report.repro_string(tool, args), severity="high"))
         return out
@@ -677,8 +687,10 @@ async def _exec_step(
         if not found:
             out["status"] = "fail"
             out["error"] = f"capture {name!r} path {path!r} did not resolve"
+            # A capture path that does not resolve is always a suite-authoring
+            # defect — the recorder wrote the wrong JSONPath.
             regressions.append(report.make_regression(
-                step_id=sid, server=logical, mcp=mcp_name, tool=tool, cls="behavioural",
+                step_id=sid, server=logical, mcp=mcp_name, tool=tool, cls="harness",
                 observed=f"capture {name} <- {path} did not resolve",
                 expected=f"{path} present in result",
                 repro=report.repro_string(tool, args), severity="high"))
