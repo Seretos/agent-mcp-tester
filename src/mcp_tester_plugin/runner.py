@@ -11,6 +11,7 @@ This module owns ALL JSON-RPC and ALL process spawning. No LLM agent ever does.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import re
@@ -30,7 +31,59 @@ from . import assertions, report, resolve, suites
 
 
 # --------------------------------------------------------------------------
-# Exception unwrapping
+# Exception-formatting and re-raise helpers (used at every catch site)
+# --------------------------------------------------------------------------
+
+def _format_exc(exc: BaseException) -> str:
+    """Return a human-readable string for *exc*.
+
+    Unwraps ``BaseExceptionGroup`` sub-exceptions (joined with ``"; "``);
+    falls back to ``"TypeName: message"`` for everything else.
+    """
+    if isinstance(exc, BaseExceptionGroup):
+        return "; ".join(f"{type(e).__name__}: {e}" for e in exc.exceptions)
+    return f"{type(exc).__name__}: {exc}"
+
+
+_FATAL = (KeyboardInterrupt, SystemExit, asyncio.CancelledError)
+
+
+def _contains_fatal(exc: BaseException) -> bool:
+    """Return True if *exc* is, or recursively contains, a fatal exception.
+
+    Handles nested ``BaseExceptionGroup`` trees, which anyio produces during
+    TaskGroup and AsyncExitStack teardown when a ``CancelledError`` is
+    delivered as a group.
+    """
+    if isinstance(exc, _FATAL):
+        return True
+    if isinstance(exc, BaseExceptionGroup):
+        return any(_contains_fatal(e) for e in exc.exceptions)
+    return False
+
+
+def _reraise_if_fatal(exc: BaseException) -> None:
+    """Re-raise *exc* if it is a cancellation / interrupt / exit signal.
+
+    Must be called at the top of every ``except BaseException`` block that
+    would otherwise swallow the exception into a structured-error dict.
+    Cancellation, keyboard-interrupt, and system-exit must always propagate
+    so that anyio task-group teardown and MCP-server shutdown work correctly.
+
+    Also handles ``BaseExceptionGroup`` wrapping — anyio delivers cancellation
+    during TaskGroup/AsyncExitStack teardown as
+    ``BaseExceptionGroup("...", [CancelledError()])`` whose top-level type is
+    NOT ``CancelledError``.  Without this check the group would slip past the
+    simple ``isinstance`` guard and be swallowed into a structured-error dict.
+    """
+    if isinstance(exc, _FATAL):
+        raise
+    if isinstance(exc, BaseExceptionGroup) and _contains_fatal(exc):
+        raise
+
+
+# --------------------------------------------------------------------------
+# Exception unwrapping (PR #19 — opaque crash reporting)
 # --------------------------------------------------------------------------
 def _unwrap_exception(exc: Exception) -> str:
     """Return a readable error string, unwrapping ExceptionGroup wrappers.
@@ -297,7 +350,14 @@ async def validate_suite_async(
             "dataflow_warnings": suites.dataflow_warnings(doc),
         }
     if verify_replay:
-        rep = await _replay(doc, root, overrides or {}, "continue")
+        try:
+            rep = await _replay(doc, root, overrides or {}, "continue")
+        except BaseException as exc:  # noqa: BLE001
+            # _replay's own outer guard normally catches all BaseExceptions, but
+            # belt-and-suspenders: if anything escapes, surface it as an error
+            # report rather than propagating and crashing the MCP tool.
+            _reraise_if_fatal(exc)
+            rep = {"result": "error", "error": _format_exc(exc)}
         out["verify_replay"] = rep
     return out
 
@@ -373,73 +433,101 @@ async def _replay(
 
     child_env = _child_env()
 
-    async with AsyncExitStack() as stack:
-        sessions: dict[str, tuple[ClientSession, set[str], str]] = {}
-        init_failed = False
+    try:
+        async with AsyncExitStack() as stack:
+            sessions: dict[str, tuple[ClientSession, set[str], str]] = {}
+            init_failed = False
 
-        for logical in referenced:
-            spec = server_specs[logical]
-            entry: dict[str, Any] = {"logical": logical, "plugin": spec.get("plugin")}
-            try:
-                launch = resolve.resolve(
-                    logical, spec, root=root, overrides=overrides, targets=targets
-                )
-            except resolve.ResolutionError as exc:
-                entry.update(resolved_via="unresolved", init_ok=False, error=str(exc))
-                server_report.append(entry)
-                init_failed = True
-                continue
+            for logical in referenced:
+                spec = server_specs[logical]
+                entry: dict[str, Any] = {"logical": logical, "plugin": spec.get("plugin")}
+                try:
+                    launch = resolve.resolve(
+                        logical, spec, root=root, overrides=overrides, targets=targets
+                    )
+                except resolve.ResolutionError as exc:
+                    entry.update(resolved_via="unresolved", init_ok=False, error=str(exc))
+                    server_report.append(entry)
+                    init_failed = True
+                    continue
 
-            entry.update(
-                resolved_via=launch.source,
-                server=launch.server,
-                command=launch.command,
-            )
-            try:
-                params = StdioServerParameters(
+                entry.update(
+                    resolved_via=launch.source,
+                    server=launch.server,
                     command=launch.command,
-                    args=launch.args,
-                    env=child_env,
-                    cwd=str(root),
                 )
-                read, write = await stack.enter_async_context(stdio_client(params))
-                session = await stack.enter_async_context(ClientSession(read, write))
-                await session.initialize()
-                listed = await session.list_tools()
-                toolnames = {t.name for t in listed.tools}
-                sessions[logical] = (session, toolnames, spec.get("plugin") or logical)
-                entry["init_ok"] = True
-                entry["tools"] = len(toolnames)
-            except Exception as exc:  # noqa: BLE001
-                entry["init_ok"] = False
-                entry["error"] = f"{type(exc).__name__}: {exc}"
-                init_failed = True
-            server_report.append(entry)
+                try:
+                    params = StdioServerParameters(
+                        command=launch.command,
+                        args=launch.args,
+                        env=child_env,
+                        cwd=str(root),
+                    )
+                    read, write = await stack.enter_async_context(stdio_client(params))
+                    session = await stack.enter_async_context(ClientSession(read, write))
+                    await session.initialize()
+                    listed = await session.list_tools()
+                    toolnames = {t.name for t in listed.tools}
+                    sessions[logical] = (session, toolnames, spec.get("plugin") or logical)
+                    entry["init_ok"] = True
+                    entry["tools"] = len(toolnames)
+                except BaseException as exc:  # noqa: BLE001
+                    _reraise_if_fatal(exc)
+                    entry["init_ok"] = False
+                    entry["error"] = _format_exc(exc)
+                    init_failed = True
+                server_report.append(entry)
 
-        # ---- steps ----
-        aborted = False
-        for step in doc.get("steps", []):
-            step = _normalize_placeholders(step)
-            if aborted:
-                step_results.append({"id": step.get("id"), "status": "skipped",
-                                     "reason": "aborted by policy"})
-                continue
-            res = await _exec_step(
-                step, sessions, variables, regressions, is_teardown=False
-            )
-            step_results.append(res)
-            if res["status"] == "fail" and policy == "abort":
-                aborted = True
+            # ---- steps ----
+            aborted = False
+            for step in doc.get("steps", []):
+                step = _normalize_placeholders(step)
+                if aborted:
+                    step_results.append({"id": step.get("id"), "status": "skipped",
+                                         "reason": "aborted by policy"})
+                    continue
+                res = await _exec_step(
+                    step, sessions, variables, regressions, is_teardown=False
+                )
+                step_results.append(res)
+                if res["status"] == "fail" and policy == "abort":
+                    aborted = True
 
-        # ---- teardown (always) ----
-        for step in doc.get("teardown", []) or []:
-            step = _normalize_placeholders(step)
-            res = await _exec_step(
-                step, sessions, variables, regressions, is_teardown=True
-            )
-            step_results.append(res)
-            if res["status"] in ("fail", "skipped") and res.get("teardown_note"):
-                teardown_warnings.append(res["teardown_note"])
+            # ---- teardown (always) ----
+            for step in doc.get("teardown", []) or []:
+                step = _normalize_placeholders(step)
+                res = await _exec_step(
+                    step, sessions, variables, regressions, is_teardown=True
+                )
+                step_results.append(res)
+                if res["status"] in ("fail", "skipped") and res.get("teardown_note"):
+                    teardown_warnings.append(res["teardown_note"])
+    except BaseException as exc:  # noqa: BLE001
+        # An ExceptionGroup (or other BaseException) escaped the per-server guards
+        # (e.g. during anyio TaskGroup teardown or step execution). Return a
+        # structured report rather than propagating.
+        _reraise_if_fatal(exc)
+        err_msg = _format_exc(exc)
+        return {
+            "suite": doc.get("suite"),
+            "run_id": run_id,
+            "started_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(started)),
+            "duration_ms": int((time.time() - started) * 1000),
+            "policy": policy,
+            "result": "error",
+            "phase": "execution",
+            "error": err_msg,
+            "counts": {
+                "steps": len(step_results),
+                "passed": 0,
+                "failed": 0,
+                "teardown_warnings": 0,
+            },
+            "servers": server_report,
+            "steps": step_results,
+            "regressions": regressions,
+            "teardown_warnings": teardown_warnings,
+        }
 
     passed = sum(1 for r in step_results if r["status"] == "pass")
     failed = sum(1 for r in step_results if r["status"] == "fail")

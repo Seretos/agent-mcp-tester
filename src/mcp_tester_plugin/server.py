@@ -16,6 +16,8 @@ from typing import Any
 
 from mcp.server.fastmcp import FastMCP
 
+from .runner import _format_exc, _reraise_if_fatal
+
 mcp = FastMCP("mcp-tester")
 
 
@@ -43,10 +45,12 @@ async def run_suite(suite: str, policy: str = "continue") -> dict:
 
     try:
         return await runner.run_async(suite, policy=policy)
-    except Exception as exc:  # noqa: BLE001
+    except BaseException as exc:  # noqa: BLE001
+        _reraise_if_fatal(exc)
+        err_msg = _format_exc(exc)
         return {
             "result": "error",
-            "error": runner._unwrap_exception(exc),
+            "error": err_msg,
             "suite": suite,
             "run_id": None,
             "counts": {},
@@ -104,6 +108,16 @@ async def validate_suite(suite: str, verify_replay: bool = True) -> dict:
             "valid": True,
             "error": runner._unwrap_exception(exc),
             "suite": suite,
+        }
+    except BaseException as exc:  # noqa: BLE001
+        # True BaseException (not Exception subclass, e.g. bare BaseException).
+        # Re-raise fatal signals (CancelledError, KeyboardInterrupt, SystemExit);
+        # for non-fatal bare BaseExceptions surface as valid=False (unexpected crash).
+        _reraise_if_fatal(exc)
+        err_msg = _format_exc(exc)
+        return {
+            "valid": False,
+            "error": err_msg,
         }
 
 
