@@ -104,7 +104,10 @@ def load(path: Path) -> dict[str, Any]:
     if not path.is_file():
         raise SuiteError(f"suite not found: {path}")
     with path.open("r", encoding="utf-8") as fh:
-        doc = yaml.safe_load(fh)
+        try:
+            doc = yaml.safe_load(fh)
+        except yaml.YAMLError as exc:
+            raise SuiteError(f"suite {path} contains invalid YAML: {exc}") from exc
     if not isinstance(doc, dict):
         raise SuiteError(f"suite {path} is not a YAML mapping")
     validate(doc)
