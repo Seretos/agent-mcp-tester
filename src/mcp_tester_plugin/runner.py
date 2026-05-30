@@ -81,6 +81,26 @@ def _reraise_if_fatal(exc: BaseException) -> None:
     if isinstance(exc, BaseExceptionGroup) and _contains_fatal(exc):
         raise
 
+
+# --------------------------------------------------------------------------
+# Exception unwrapping (PR #19 — opaque crash reporting)
+# --------------------------------------------------------------------------
+def _unwrap_exception(exc: Exception) -> str:
+    """Return a readable error string, unwrapping ExceptionGroup wrappers.
+
+    ``hasattr(exc, 'exceptions')`` covers both the Python 3.11+ built-in
+    ``ExceptionGroup`` and the ``exceptiongroup`` backport anyio uses on 3.10.
+    No version-conditional import needed.
+    """
+    if hasattr(exc, "exceptions") and exc.exceptions:
+        inner = exc.exceptions[0]
+        return (
+            f"{type(exc).__name__}: {exc} | caused by: "
+            f"{type(inner).__name__}: {inner}"
+        )
+    return f"{type(exc).__name__}: {exc}"
+
+
 # --------------------------------------------------------------------------
 # Double-brace placeholder normalisation
 # --------------------------------------------------------------------------
@@ -138,7 +158,19 @@ def run(
     root = root or suites.find_root()
     path = suites.resolve_suite_path(suite, root)
     doc = suites.load(path)
-    rep = anyio.run(_replay, doc, root, overrides or {}, policy)
+    try:
+        rep = anyio.run(_replay, doc, root, overrides or {}, policy)
+    except Exception as exc:  # noqa: BLE001
+        return {
+            "result": "error",
+            "error": _unwrap_exception(exc),
+            "suite": doc.get("suite"),
+            "suite_file": str(path),
+            "run_id": None,
+            "counts": {},
+            "servers": [],
+            "regressions": [],
+        }
     rep["suite_file"] = str(path)
     return rep
 
@@ -170,7 +202,12 @@ def validate_suite(
         is_inline = True
 
     if is_inline:
-        doc = yaml.safe_load(suite)
+        try:
+            doc = yaml.safe_load(suite)
+        except yaml.YAMLError as exc:
+            raise suites.SuiteError(
+                f"suite input is not valid YAML: {exc}"
+            ) from exc
         if not isinstance(doc, dict):
             raise suites.SuiteError(
                 "suite input is not a file path/name and does not parse as a YAML mapping"
@@ -189,7 +226,17 @@ def validate_suite(
             "dataflow_warnings": suites.dataflow_warnings(doc),
         }
     if verify_replay:
-        rep = anyio.run(_replay, doc, root, overrides or {}, "continue")
+        try:
+            rep = anyio.run(_replay, doc, root, overrides or {}, "continue")
+        except Exception as exc:  # noqa: BLE001
+            # Schema validation already passed (out["valid"] is True).  A crash
+            # here is a runtime problem at replay time — NOT a schema problem.
+            # Preserve valid=True so callers (and cli_dispatch) honour the
+            # "valid reflects schema validity only" contract.
+            return {
+                **out,
+                "verify_replay": {"result": "error", "error": _unwrap_exception(exc)},
+            }
         out["verify_replay"] = rep
     return out
 
@@ -279,7 +326,12 @@ async def validate_suite_async(
         is_inline = True
 
     if is_inline:
-        doc = yaml.safe_load(suite)
+        try:
+            doc = yaml.safe_load(suite)
+        except yaml.YAMLError as exc:
+            raise suites.SuiteError(
+                f"suite input is not valid YAML: {exc}"
+            ) from exc
         if not isinstance(doc, dict):
             raise suites.SuiteError(
                 "suite input is not a file path/name and does not parse as a YAML mapping"

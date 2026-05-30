@@ -260,25 +260,35 @@ def _make_suite_file(tmp_path: Path) -> Path:
 
 
 # --------------------------------------------------------------------------
-# Regression: sync run() must NOT be called from within a running event loop
+# Regression: sync run() called from within a running event loop returns an
+# error dict (ticket #19: structured errors instead of raw crashes).
 # --------------------------------------------------------------------------
 @pytest.mark.anyio
-async def test_run_from_running_loop_crashes(monkeypatch, tmp_path):
-    """The SYNC runner.run() raises RuntimeError when called from a running loop.
+async def test_run_from_running_loop_returns_error_dict(monkeypatch, tmp_path):
+    """Calling the SYNC runner.run() from a running event loop now returns a
+    structured error dict instead of propagating the RuntimeError.
 
-    This documents the original crash (asyncio.run / anyio.run inside an
-    already-running loop). The async entry points introduced to fix the bug
-    avoid this path entirely.
+    anyio.run() raises RuntimeError when called from within an already-running
+    loop; after ticket #19 the except-clause in run() catches that and returns
+    a dict with result='error' so the MCP/CLI caller always gets a well-formed
+    report. The async entry points (run_async) remain the correct path for
+    in-loop callers.
     """
     async def stub_replay(*_args, **_kwargs) -> dict[str, Any]:
         return STUB_PASS_REPORT
 
     monkeypatch.setattr(runner, "_replay", stub_replay)
-    suite_path = _make_suite_file(tmp_path)
+    _make_suite_file(tmp_path)
     monkeypatch.setenv("MCP_TESTER_ROOT", str(tmp_path))
 
-    with pytest.raises(RuntimeError):
-        runner.run("test__minimal")
+    result = runner.run("test__minimal")
+
+    assert isinstance(result, dict), f"Expected dict, got {type(result)}: {result!r}"
+    assert result.get("result") == "error", f"Expected result='error', got: {result}"
+    assert "error" in result, f"Expected 'error' key, got: {result}"
+    assert "RuntimeError" in result["error"], (
+        f"Expected 'RuntimeError' in error string, got: {result['error']!r}"
+    )
 
 
 # --------------------------------------------------------------------------
@@ -1758,6 +1768,137 @@ async def test_server_run_suite_exception_group_caught(monkeypatch):
 
 
 # --------------------------------------------------------------------------
+# Ticket #19: ExceptionGroup unwrapping + validate_suite error handling
+# --------------------------------------------------------------------------
+
+def test_unwrap_exception_extracts_inner_from_exception_group():
+    """_unwrap_exception on an ExceptionGroup must surface the inner exception type
+    and message so callers see the actual cause, not the opaque group wrapper."""
+    eg = ExceptionGroup("group", [RuntimeError("server spawn failed")])
+    result = runner._unwrap_exception(eg)
+    assert "RuntimeError" in result, f"Expected 'RuntimeError' in {result!r}"
+    assert "server spawn failed" in result, f"Expected 'server spawn failed' in {result!r}"
+
+
+def test_unwrap_exception_plain_exception():
+    """_unwrap_exception on a plain exception returns 'ClassName: message' without
+    any unwrapping."""
+    result = runner._unwrap_exception(ValueError("bad"))
+    assert result == "ValueError: bad", f"Unexpected result: {result!r}"
+
+
+def test_unwrap_exception_nested_exception_group():
+    """_unwrap_exception on a two-level nested ExceptionGroup surfaces only the
+    first inner exception (one level of unwrapping)."""
+    inner_eg = ExceptionGroup("inner", [TypeError("type problem")])
+    outer_eg = ExceptionGroup("outer", [inner_eg])
+    result = runner._unwrap_exception(outer_eg)
+    # The outer group's first exception is inner_eg, an ExceptionGroup itself.
+    # We only unwrap one level — the inner ExceptionGroup type name must appear.
+    assert "ExceptionGroup" in result, f"Expected 'ExceptionGroup' in {result!r}"
+
+
+def test_unwrap_exception_empty_exceptions_list():
+    """_unwrap_exception falls back to plain format when .exceptions is an empty list,
+    avoiding an IndexError on exc.exceptions[0]."""
+    class _FakeGroup(Exception):
+        exceptions: list = []
+
+    obj = _FakeGroup("empty group")
+    result = runner._unwrap_exception(obj)
+    # Falls through to the plain format path.
+    assert "_FakeGroup" in result, f"Expected '_FakeGroup' in {result!r}"
+    assert "empty group" in result, f"Expected 'empty group' in {result!r}"
+    # Must NOT contain the 'caused by' clause.
+    assert "caused by" not in result, f"Unexpected 'caused by' in {result!r}"
+
+
+@pytest.mark.anyio
+async def test_run_suite_error_dict_unwraps_exception_group(monkeypatch):
+    """run_suite (MCP tool) must unwrap an ExceptionGroup raised by run_async so
+    the error string names the inner exception rather than the opaque group."""
+    from mcp_tester_plugin import runner as _runner
+    from mcp_tester_plugin import server
+
+    async def raise_eg(suite, *, policy, **kwargs):
+        raise ExceptionGroup("g", [RuntimeError("inner boom")])
+
+    monkeypatch.setattr(_runner, "run_async", raise_eg)
+
+    result = await server.run_suite("test__minimal", policy="continue")
+
+    assert isinstance(result, dict), f"Expected dict, got {type(result)}: {result!r}"
+    assert result.get("result") == "error", f"Expected result='error', got: {result}"
+    assert "RuntimeError" in result["error"], (
+        f"Expected 'RuntimeError' in error string, got: {result['error']!r}"
+    )
+    assert "inner boom" in result["error"], (
+        f"Expected 'inner boom' in error string, got: {result['error']!r}"
+    )
+
+
+@pytest.mark.anyio
+async def test_validate_suite_mcp_tool_returns_error_dict_on_exception(monkeypatch):
+    """validate_suite (MCP tool) must catch non-SuiteError exceptions from
+    validate_suite_async and return a structured error dict with valid=True.
+
+    A RuntimeError from _replay is a runtime crash that occurs AFTER schema
+    validation passed.  Per the documented contract ("valid reflects schema
+    validity only") valid must remain True; only a SuiteError signals an
+    invalid schema.
+    """
+    from mcp_tester_plugin import runner as _runner
+    from mcp_tester_plugin import server
+
+    async def raise_exc(*args, **kwargs):
+        raise RuntimeError("replay exploded")
+
+    monkeypatch.setattr(_runner, "validate_suite_async", raise_exc)
+
+    result = await server.validate_suite("test__minimal", verify_replay=True)
+
+    assert isinstance(result, dict), f"Expected dict, got {type(result)}: {result!r}"
+    assert result.get("valid") is True, (
+        f"Expected valid=True for a non-SuiteError crash (schema was valid), got: {result}"
+    )
+    assert "error" in result, f"Expected 'error' key, got: {result}"
+    assert "RuntimeError" in result["error"], (
+        f"Expected 'RuntimeError' in error string, got: {result['error']!r}"
+    )
+
+
+@pytest.mark.anyio
+async def test_validate_suite_mcp_tool_unwraps_exception_group(monkeypatch):
+    """validate_suite (MCP tool) must unwrap an ExceptionGroup so the inner
+    exception type and message are visible in the returned error string.
+
+    An ExceptionGroup from _replay is a runtime crash that occurs AFTER schema
+    validation passed.  Per the "valid reflects schema validity only" contract,
+    valid must remain True.
+    """
+    from mcp_tester_plugin import runner as _runner
+    from mcp_tester_plugin import server
+
+    async def raise_eg(*args, **kwargs):
+        raise ExceptionGroup("g", [OSError("pipe broken")])
+
+    monkeypatch.setattr(_runner, "validate_suite_async", raise_eg)
+
+    result = await server.validate_suite("test__minimal", verify_replay=True)
+
+    assert isinstance(result, dict), f"Expected dict, got {type(result)}: {result!r}"
+    assert result.get("valid") is True, (
+        f"Expected valid=True for ExceptionGroup crash (schema was valid), got: {result}"
+    )
+    assert "OSError" in result["error"], (
+        f"Expected 'OSError' in error string, got: {result['error']!r}"
+    )
+    assert "pipe broken" in result["error"], (
+        f"Expected 'pipe broken' in error string, got: {result['error']!r}"
+    )
+
+
+# --------------------------------------------------------------------------
 # Ticket #18 review: CancelledError (and KeyboardInterrupt) must PROPAGATE,
 # never be swallowed into a structured-error dict.
 # --------------------------------------------------------------------------
@@ -2029,3 +2170,215 @@ async def test_replay_nested_cancelled_group_propagates(monkeypatch, tmp_path):
     # The nested group must propagate, not be swallowed.
     with pytest.raises(BaseExceptionGroup):
         await _runner._replay(_EG_SUITE_DOC, tmp_path, {}, "continue")
+
+
+# --------------------------------------------------------------------------
+# Ticket #19 reviewer [blocking 1+2]: valid-preservation invariant under raise
+# --------------------------------------------------------------------------
+
+def test_sync_validate_suite_valid_preserved_when_anyio_run_raises(monkeypatch, tmp_path):
+    """Sync runner.validate_suite must preserve valid=True when anyio.run raises.
+
+    Regression test for the blocking-1 contract violation: the previous
+    implementation set valid=False when anyio.run() threw, conflating a runtime
+    crash during replay with a schema-invalid suite.  Schema validation passes
+    before anyio.run() is called, so out["valid"] is already True at crash time.
+    The fix returns {**out, "verify_replay": {...}} without overwriting valid.
+    """
+    import anyio as _anyio
+
+    def fake_anyio_run(coro_func, *args, **kwargs):
+        raise RuntimeError("spawn failed")
+
+    monkeypatch.setattr(_anyio, "run", fake_anyio_run)
+    _make_suite_file(tmp_path)
+    monkeypatch.setenv("MCP_TESTER_ROOT", str(tmp_path))
+
+    result = runner.validate_suite("test__minimal", verify_replay=True)
+
+    assert isinstance(result, dict), f"Expected dict, got {type(result)}: {result!r}"
+    assert result.get("valid") is True, (
+        f"valid must be True when replay raises (schema was valid), got: {result}"
+    )
+    # The error must be surfaced under verify_replay, not as a top-level valid=False.
+    assert "verify_replay" in result, (
+        f"Expected 'verify_replay' key in result, got: {result}"
+    )
+    vr = result["verify_replay"]
+    assert isinstance(vr, dict), f"verify_replay must be a dict, got: {vr!r}"
+    assert "error" in vr, f"Expected 'error' in verify_replay, got: {vr}"
+    assert "RuntimeError" in vr["error"], (
+        f"Expected 'RuntimeError' in verify_replay.error, got: {vr['error']!r}"
+    )
+    assert "spawn failed" in vr["error"], (
+        f"Expected 'spawn failed' in verify_replay.error, got: {vr['error']!r}"
+    )
+
+
+def test_sync_validate_suite_valid_preserved_on_exception_group(monkeypatch, tmp_path):
+    """Sync runner.validate_suite must preserve valid=True when anyio.run raises
+    an ExceptionGroup (the common case when anyio wraps child process errors).
+    """
+    import anyio as _anyio
+
+    def fake_anyio_run(coro_func, *args, **kwargs):
+        raise ExceptionGroup("replay", [OSError("child died")])
+
+    monkeypatch.setattr(_anyio, "run", fake_anyio_run)
+    _make_suite_file(tmp_path)
+    monkeypatch.setenv("MCP_TESTER_ROOT", str(tmp_path))
+
+    result = runner.validate_suite("test__minimal", verify_replay=True)
+
+    assert result.get("valid") is True, (
+        f"valid must be True when ExceptionGroup raised (schema was valid), got: {result}"
+    )
+    vr = result.get("verify_replay", {})
+    assert "error" in vr, f"Expected error in verify_replay, got: {result}"
+    assert "OSError" in vr["error"], (
+        f"Expected 'OSError' in verify_replay.error, got: {vr['error']!r}"
+    )
+    assert "child died" in vr["error"], (
+        f"Expected 'child died' in verify_replay.error, got: {vr['error']!r}"
+    )
+
+
+@pytest.mark.anyio
+async def test_server_validate_suite_valid_true_on_exception_group(monkeypatch, tmp_path):
+    """server.validate_suite (MCP tool) must return valid=True when _replay raises
+    an ExceptionGroup (schema-valid suite, runtime crash during replay).
+
+    This tests the two-exception-type dispatch in server.validate_suite: only a
+    SuiteError means the schema was invalid; any other exception is a replay crash
+    and must not pollute the valid flag.
+    """
+    from mcp_tester_plugin import runner as _runner
+    from mcp_tester_plugin import server
+
+    async def raise_eg(*args, **kwargs):
+        raise ExceptionGroup("replay", [ConnectionError("server unreachable")])
+
+    monkeypatch.setattr(_runner, "validate_suite_async", raise_eg)
+
+    result = await server.validate_suite("test__minimal", verify_replay=True)
+
+    assert isinstance(result, dict), f"Expected dict, got {type(result)}: {result!r}"
+    assert result.get("valid") is True, (
+        f"Expected valid=True for ExceptionGroup (schema was valid), got: {result}"
+    )
+    assert "error" in result, f"Expected 'error' key in result, got: {result}"
+    assert "ConnectionError" in result["error"], (
+        f"Expected 'ConnectionError' in error, got: {result['error']!r}"
+    )
+    assert "server unreachable" in result["error"], (
+        f"Expected 'server unreachable' in error, got: {result['error']!r}"
+    )
+
+
+@pytest.mark.anyio
+async def test_server_validate_suite_valid_false_on_suite_error(monkeypatch):
+    """server.validate_suite (MCP tool) must return valid=False when
+    validate_suite_async raises SuiteError (genuine schema-invalid input).
+
+    This pins the correct-side of the two-exception-type dispatch: a SuiteError
+    IS a schema problem and must yield valid=False.
+    """
+    from mcp_tester_plugin import runner as _runner
+    from mcp_tester_plugin import server
+    from mcp_tester_plugin import suites as _suites
+
+    async def raise_suite_error(*args, **kwargs):
+        raise _suites.SuiteError("suite must have a top-level 'schema: 1' field (got None)")
+
+    monkeypatch.setattr(_runner, "validate_suite_async", raise_suite_error)
+
+    result = await server.validate_suite("bad_suite", verify_replay=False)
+
+    assert isinstance(result, dict), f"Expected dict, got {type(result)}: {result!r}"
+    assert result.get("valid") is False, (
+        f"Expected valid=False for SuiteError (schema invalid), got: {result}"
+    )
+    assert "error" in result, f"Expected 'error' key in result, got: {result}"
+    assert "schema: 1" in result["error"], (
+        f"Expected schema error message in error, got: {result['error']!r}"
+    )
+
+
+# --------------------------------------------------------------------------
+# Ticket #19 blocking: malformed YAML must return valid=False, not valid=True
+# --------------------------------------------------------------------------
+
+@pytest.mark.anyio
+async def test_server_validate_suite_malformed_yaml_returns_valid_false(monkeypatch, tmp_path):
+    """Regression: passing syntactically-broken YAML to server.validate_suite must
+    return valid=False (not valid=True).
+
+    Before the fix, yaml.YAMLError from yaml.safe_load() was NOT a SuiteError, so
+    it fell into the 'except Exception' handler in server.validate_suite and returned
+    valid=True — telling the caller a malformed suite was schema-valid.  The fix
+    wraps yaml.safe_load() so YAMLError is re-raised as SuiteError, which the
+    SuiteError handler catches and returns valid=False.
+    """
+    from mcp_tester_plugin import server
+
+    # Syntactically broken YAML — unclosed flow mapping triggers ScannerError.
+    broken_yaml = "{{ not valid yaml at all"
+
+    monkeypatch.setenv("MCP_TESTER_ROOT", str(tmp_path))
+    # No mcp-suites/ dir so the input cannot resolve as a file path, forcing
+    # the inline-YAML branch where yaml.safe_load is called.
+
+    result = await server.validate_suite(broken_yaml, verify_replay=False)
+
+    assert isinstance(result, dict), f"Expected dict, got {type(result)}: {result!r}"
+    assert result.get("valid") is False, (
+        f"Malformed YAML must return valid=False, got: {result}"
+    )
+    assert "error" in result, f"Expected 'error' key in result, got: {result}"
+
+
+@pytest.mark.anyio
+async def test_validate_suite_async_malformed_yaml_raises_suite_error(monkeypatch, tmp_path):
+    """runner.validate_suite_async must raise SuiteError (not yaml.YAMLError) when
+    the inline input is syntactically broken YAML.
+
+    This confirms the fix is in the right layer: SuiteError propagates cleanly to
+    server.validate_suite's except-SuiteError branch, yielding valid=False.
+    """
+    import yaml as _yaml
+
+    monkeypatch.setenv("MCP_TESTER_ROOT", str(tmp_path))
+
+    with pytest.raises(suites.SuiteError) as exc_info:
+        await runner.validate_suite_async("{{ not valid yaml", verify_replay=False)
+
+    # Must be SuiteError, not raw YAMLError.
+    assert not isinstance(exc_info.value, _yaml.YAMLError), (
+        "validate_suite_async must wrap YAMLError as SuiteError, not propagate it raw"
+    )
+    assert "not valid YAML" in str(exc_info.value) or "YAML" in str(exc_info.value), (
+        f"Error message should mention YAML, got: {exc_info.value!r}"
+    )
+
+
+def test_suites_load_malformed_yaml_raises_suite_error(tmp_path):
+    """suites.load on a file with syntactically broken YAML must raise SuiteError
+    (not yaml.YAMLError), so the file-path branch of validate_suite also returns
+    valid=False via the SuiteError handler.
+    """
+    import yaml as _yaml
+
+    sdir = tmp_path / "mcp-suites"
+    sdir.mkdir()
+    broken_file = sdir / "broken.yaml"
+    broken_file.write_text("key: [\nnot closed", encoding="utf-8")
+
+    with pytest.raises(suites.SuiteError) as exc_info:
+        suites.load(broken_file)
+
+    assert not isinstance(exc_info.value, _yaml.YAMLError), (
+        "suites.load must wrap YAMLError as SuiteError, not propagate it raw"
+    )
+    assert "invalid YAML" in str(exc_info.value) or "YAML" in str(exc_info.value), (
+        f"Error message should mention YAML, got: {exc_info.value!r}"
+    )

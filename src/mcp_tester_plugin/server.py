@@ -88,20 +88,36 @@ async def validate_suite(suite: str, verify_replay: bool = True) -> dict:
     file is written. When `verify_replay` is True, a `verify_replay` key
     contains the replay report; replay pass/fail does NOT affect `valid`.
     """
-    from . import runner
-    from . import suites
+    from . import runner, suites
 
     try:
         return await runner.validate_suite_async(suite, verify_replay=verify_replay)
-    except suites.SuiteError:
-        raise
+    except suites.SuiteError as exc:
+        # Schema/structure validation failed — valid=False is correct here.
+        return {
+            "valid": False,
+            "error": str(exc),
+            "suite": suite,
+        }
+    except Exception as exc:  # noqa: BLE001
+        # Runtime crash (e.g. ExceptionGroup from _replay, OS error, etc.)
+        # that occurred AFTER schema validation passed.  The suite is
+        # schema-valid; only the replay crashed.  Preserve valid=True per the
+        # documented contract ("valid reflects schema validity only").
+        return {
+            "valid": True,
+            "error": runner._unwrap_exception(exc),
+            "suite": suite,
+        }
     except BaseException as exc:  # noqa: BLE001
+        # True BaseException (not Exception subclass, e.g. bare BaseException).
+        # Re-raise fatal signals (CancelledError, KeyboardInterrupt, SystemExit);
+        # for non-fatal bare BaseExceptions surface as valid=False (unexpected crash).
         _reraise_if_fatal(exc)
         err_msg = _format_exc(exc)
         return {
             "valid": False,
             "error": err_msg,
-            "verify_replay": {"result": "error", "error": err_msg},
         }
 
 
