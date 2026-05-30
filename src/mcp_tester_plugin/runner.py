@@ -580,129 +580,146 @@ async def _exec_step(
         return out
     session, toolnames, mcp_name = sessions[logical]
 
-    # Substitute variables into args.
-    try:
-        args = assertions.substitute(step.get("args") or {}, variables)
-    except assertions.UnresolvedVariable as exc:
-        if is_teardown and step.get("on_missing_var") == "skip":
-            out["status"] = "skipped"
-            out["reason"] = f"unresolved ${{{exc}}} (on_missing_var: skip)"
-            return out
-        out["status"] = "fail"
-        out["error"] = f"unresolved variable {exc}"
-        regressions.append(report.make_regression(
-            step_id=sid, server=logical, mcp=mcp_name, tool=tool, cls="harness",
-            observed=f"unresolved variable {exc}", expected="all ${vars} bound",
-            repro=report.repro_string(tool, step.get("args")), severity="med"))
-        return out
-    out["args"] = args
-
-    # Contract check: is the tool even exposed?
-    if tool not in toolnames:
-        out["status"] = "fail"
-        out["error"] = "tool not advertised by list_tools"
-        regressions.append(report.make_regression(
-            step_id=sid, server=logical, mcp=mcp_name, tool=tool, cls="contract",
-            observed=f"{tool} absent from server's tool list",
-            expected=f"{tool} exposed by {mcp_name}",
-            repro=report.repro_string(tool, args), severity="high"))
-        return out
-
-    # Call the tool.
-    try:
-        result = await session.call_tool(tool, arguments=args)
-    except BaseException as exc:  # noqa: BLE001
-        _reraise_if_fatal(exc)
-        out["status"] = "fail"
-        out["error"] = _format_exc(exc)
-        if is_teardown:
-            out["teardown_note"] = f"{sid}: call failed ({exc})"
-            return out
-        regressions.append(report.make_regression(
-            step_id=sid, server=logical, mcp=mcp_name, tool=tool, cls="harness",
-            observed=f"call raised {_format_exc(exc)}",
-            expected="tool call returns a result",
-            repro=report.repro_string(tool, args), severity="med"))
-        return out
-
-    data, text, is_error = _parse_result(result)
-    out["is_error"] = is_error
-    out["result_excerpt"] = _excerpt(data)
-
-    # Evaluate assertions.
-    expects = step.get("expect") or []
-    assertion_results: list[dict[str, Any]] = []
-    for a in expects:
-        a2 = dict(a)
-        if "value" in a2:
-            try:
-                a2["value"] = assertions.substitute(a2["value"], variables)
-            except assertions.UnresolvedVariable as exc:
-                assertion_results.append({"path": a.get("path"), "op": a.get("op"),
-                                          "ok": False, "error": f"unresolved {exc}"})
-                continue
-        assertion_results.append(assertions.evaluate(a2, data))
-    out["assertions"] = assertion_results
-
-    all_ok = all(a.get("ok") for a in assertion_results)
-    # A tool-level error with no assertion explicitly inspecting it is a failure.
-    if is_error and not expects:
-        all_ok = False
-
-    if not all_ok:
-        out["status"] = "fail"
-        if is_teardown:
-            out["teardown_note"] = f"{sid}: teardown assertions failed"
-            return out
-        failed = [a for a in assertion_results if not a.get("ok")]
-        observed = "; ".join(
-            f"{a.get('path')} {a.get('op')} -> actual={a.get('actual')!r}"
-            + (f" ({a['error']})" if a.get("error") else "")
-            for a in failed
-        ) or ("tool returned isError" if is_error else "assertion failed")
-        expected = "; ".join(
-            f"{a.get('path')} {a.get('op')} {a.get('value', '')}".strip()
-            for a in failed
-        )
-        # If every failed assertion is a "path did not resolve" error the
-        # root cause is a wrong JSONPath in the suite (suite-authoring defect),
-        # not a behavioural regression in the MCP under test.
-        # Guard: an empty failed list (e.g. is_error with no expect entries)
-        # must NOT be treated as "all path misses" — that would mislabel an
-        # is_error/no-expect failure as class="harness" instead of "behavioural".
-        all_path_miss = bool(failed) and all(
-            a.get("error") == "path did not resolve" for a in failed
-        )
-        assertion_cls = "harness" if all_path_miss else "behavioural"
-        regressions.append(report.make_regression(
-            step_id=sid, server=logical, mcp=mcp_name, tool=tool, cls=assertion_cls,
-            observed=observed, expected=expected or "assertions hold",
-            repro=report.repro_string(tool, args), severity="high"))
-        return out
-
-    # Bind captures.
-    capture = step.get("capture") or {}
-    captured: dict[str, Any] = {}
-    for name, path in capture.items():
-        found, value = assertions.extract_one(path, data)
-        if not found:
+    try:  # noqa: BLE001 — broad guard: any non-fatal BaseException becomes a structured fail
+        # Substitute variables into args.
+        try:
+            args = assertions.substitute(step.get("args") or {}, variables)
+        except assertions.UnresolvedVariable as exc:
+            if is_teardown and step.get("on_missing_var") == "skip":
+                out["status"] = "skipped"
+                out["reason"] = f"unresolved ${{{exc}}} (on_missing_var: skip)"
+                return out
             out["status"] = "fail"
-            out["error"] = f"capture {name!r} path {path!r} did not resolve"
-            # A capture path that does not resolve is always a suite-authoring
-            # defect — the recorder wrote the wrong JSONPath.
+            out["error"] = f"unresolved variable {exc}"
             regressions.append(report.make_regression(
                 step_id=sid, server=logical, mcp=mcp_name, tool=tool, cls="harness",
-                observed=f"capture {name} <- {path} did not resolve",
-                expected=f"{path} present in result",
+                observed=f"unresolved variable {exc}", expected="all ${vars} bound",
+                repro=report.repro_string(tool, step.get("args")), severity="med"))
+            return out
+        out["args"] = args
+
+        # Contract check: is the tool even exposed?
+        if tool not in toolnames:
+            out["status"] = "fail"
+            out["error"] = "tool not advertised by list_tools"
+            regressions.append(report.make_regression(
+                step_id=sid, server=logical, mcp=mcp_name, tool=tool, cls="contract",
+                observed=f"{tool} absent from server's tool list",
+                expected=f"{tool} exposed by {mcp_name}",
                 repro=report.repro_string(tool, args), severity="high"))
             return out
-        variables[name] = value
-        captured[name] = value
-    if captured:
-        out["captured"] = captured
 
-    out["status"] = "pass"
-    return out
+        # Call the tool.
+        try:
+            result = await session.call_tool(tool, arguments=args)
+        except BaseException as exc:  # noqa: BLE001
+            _reraise_if_fatal(exc)
+            out["status"] = "fail"
+            out["error"] = _format_exc(exc)
+            if is_teardown:
+                out["teardown_note"] = f"{sid}: call failed ({exc})"
+                return out
+            regressions.append(report.make_regression(
+                step_id=sid, server=logical, mcp=mcp_name, tool=tool, cls="harness",
+                observed=f"call raised {_format_exc(exc)}",
+                expected="tool call returns a result",
+                repro=report.repro_string(tool, args), severity="med"))
+            return out
+
+        data, text, is_error = _parse_result(result)
+        out["is_error"] = is_error
+        out["result_excerpt"] = _excerpt(data)
+
+        # Evaluate assertions.
+        expects = step.get("expect") or []
+        assertion_results: list[dict[str, Any]] = []
+        for a in expects:
+            a2 = dict(a)
+            if "value" in a2:
+                try:
+                    a2["value"] = assertions.substitute(a2["value"], variables)
+                except assertions.UnresolvedVariable as exc:
+                    assertion_results.append({"path": a.get("path"), "op": a.get("op"),
+                                              "ok": False, "error": f"unresolved {exc}"})
+                    continue
+            assertion_results.append(assertions.evaluate(a2, data))
+        out["assertions"] = assertion_results
+
+        all_ok = all(a.get("ok") for a in assertion_results)
+        # A tool-level error with no assertion explicitly inspecting it is a failure.
+        if is_error and not expects:
+            all_ok = False
+
+        if not all_ok:
+            out["status"] = "fail"
+            if is_teardown:
+                out["teardown_note"] = f"{sid}: teardown assertions failed"
+                return out
+            failed = [a for a in assertion_results if not a.get("ok")]
+            observed = "; ".join(
+                f"{a.get('path')} {a.get('op')} -> actual={a.get('actual')!r}"
+                + (f" ({a['error']})" if a.get("error") else "")
+                for a in failed
+            ) or ("tool returned isError" if is_error else "assertion failed")
+            expected = "; ".join(
+                f"{a.get('path')} {a.get('op')} {a.get('value', '')}".strip()
+                for a in failed
+            )
+            # If every failed assertion is a "path did not resolve" error the
+            # root cause is a wrong JSONPath in the suite (suite-authoring defect),
+            # not a behavioural regression in the MCP under test.
+            # Guard: an empty failed list (e.g. is_error with no expect entries)
+            # must NOT be treated as "all path misses" — that would mislabel an
+            # is_error/no-expect failure as class="harness" instead of "behavioural".
+            all_path_miss = bool(failed) and all(
+                a.get("error") == "path did not resolve" for a in failed
+            )
+            assertion_cls = "harness" if all_path_miss else "behavioural"
+            regressions.append(report.make_regression(
+                step_id=sid, server=logical, mcp=mcp_name, tool=tool, cls=assertion_cls,
+                observed=observed, expected=expected or "assertions hold",
+                repro=report.repro_string(tool, args), severity="high"))
+            return out
+
+        # Bind captures.
+        capture = step.get("capture") or {}
+        captured: dict[str, Any] = {}
+        for name, path in capture.items():
+            found, value = assertions.extract_one(path, data)
+            if not found:
+                out["status"] = "fail"
+                out["error"] = f"capture {name!r} path {path!r} did not resolve"
+                # A capture path that does not resolve is always a suite-authoring
+                # defect — the recorder wrote the wrong JSONPath.
+                regressions.append(report.make_regression(
+                    step_id=sid, server=logical, mcp=mcp_name, tool=tool, cls="harness",
+                    observed=f"capture {name} <- {path} did not resolve",
+                    expected=f"{path} present in result",
+                    repro=report.repro_string(tool, args), severity="high"))
+                return out
+            variables[name] = value
+            captured[name] = value
+        if captured:
+            out["captured"] = captured
+
+        out["status"] = "pass"
+        return out
+
+    except BaseException as exc:  # noqa: BLE001
+        # Re-raise fatal signals (CancelledError, KeyboardInterrupt, SystemExit, and
+        # BaseExceptionGroup wrappers thereof) so anyio task teardown works correctly.
+        _reraise_if_fatal(exc)
+        # Any other non-fatal BaseException (e.g. BaseExceptionGroup from jsonpath_ng
+        # or assertion evaluation) becomes a structured per-step fail rather than
+        # escaping to _replay's outer handler and discarding remaining steps.
+        out["status"] = "fail"
+        out["error"] = _format_exc(exc)
+        regressions.append(report.make_regression(
+            step_id=sid, server=logical, mcp=mcp_name, tool=tool, cls="harness",
+            observed=f"step raised {_format_exc(exc)}",
+            expected="step completes without internal error",
+            repro=report.repro_string(tool, out.get("args")), severity="med"))
+        return out
 
 
 # --------------------------------------------------------------------------

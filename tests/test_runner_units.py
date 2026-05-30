@@ -2691,3 +2691,260 @@ async def test_exec_step_cancelled_error_group_reraises():
     with pytest.raises(BaseExceptionGroup):
         await runner._exec_step(step, sessions, {"RUN_ID": "r1"}, regressions,
                                 is_teardown=False)
+
+
+# --------------------------------------------------------------------------
+# Ticket #26: unguarded code paths in _exec_step (assertion evaluate, capture
+# extract_one, substitute value) must not escape as BaseExceptionGroup.
+# --------------------------------------------------------------------------
+
+@pytest.mark.anyio
+async def test_exec_step_assertion_evaluate_raises_survives_as_fail(monkeypatch):
+    """Regression (#26): BaseExceptionGroup raised inside assertions.evaluate must be
+    caught per-step and returned as status='fail' with the inner message in 'error'
+    and exactly one harness regression.  Must not re-raise.
+
+    Before Fix 1 the assertion evaluation loop was unguarded, so a BaseExceptionGroup
+    from jsonpath_ng (or any other unexpected raise) escaped _exec_step entirely,
+    hit _replay's outer handler, and produced an opaque result='error' report with
+    counts.steps=N, passed=0, failed=0 (remaining steps discarded).
+    """
+    session = _FakeSession(result_text='{"ok": true}')
+    sessions = {"s": (session, {"fake_tool"}, "fake-mcp")}
+    step = {
+        "id": "eval_step",
+        "server": "s",
+        "tool": "fake_tool",
+        "args": {},
+        "expect": [{"path": "$.ok", "op": "equals", "value": True}],
+    }
+    regressions: list[dict[str, Any]] = []
+
+    from mcp_tester_plugin import assertions as _assertions
+
+    monkeypatch.setattr(
+        _assertions,
+        "evaluate",
+        lambda *_a, **_kw: (_ for _ in ()).throw(
+            BaseExceptionGroup("eval-crash", [RuntimeError("jsonpath internal")])
+        ),
+    )
+
+    result = await runner._exec_step(step, sessions, {"RUN_ID": "r1"}, regressions,
+                                     is_teardown=False)
+
+    assert result["status"] == "fail", f"expected fail, got: {result}"
+    assert "jsonpath internal" in result.get("error", ""), (
+        f"inner exception message must appear in error: {result.get('error')!r}"
+    )
+    assert len(regressions) == 1, f"expected one regression, got: {regressions}"
+    assert regressions[0]["class"] == "harness", (
+        f"expected class=harness for unexpected internal raise, got: {regressions[0]['class']!r}"
+    )
+
+
+@pytest.mark.anyio
+async def test_exec_step_capture_extract_raises_survives_as_fail(monkeypatch):
+    """Regression (#26): BaseExceptionGroup raised inside assertions.extract_one
+    (during capture binding) must be caught per-step and returned as status='fail'
+    with the inner message in 'error' and exactly one harness regression.
+
+    Before Fix 1 the capture loop was unguarded. This test exercises a step whose
+    assertions all pass (so the code reaches the capture block) and whose
+    extract_one call raises unexpectedly.
+    """
+    # Tool returns a valid result; the step has no expect entries so assertions pass.
+    session = _FakeSession(result_text='{"id": 42}')
+    sessions = {"s": (session, {"fake_tool"}, "fake-mcp")}
+    step = {
+        "id": "cap_step",
+        "server": "s",
+        "tool": "fake_tool",
+        "args": {},
+        "capture": {"my_id": "$.id"},
+    }
+    regressions: list[dict[str, Any]] = []
+
+    from mcp_tester_plugin import assertions as _assertions
+
+    monkeypatch.setattr(
+        _assertions,
+        "extract_one",
+        lambda *_a, **_kw: (_ for _ in ()).throw(
+            BaseExceptionGroup("cap-crash", [RuntimeError("cap internal")])
+        ),
+    )
+
+    result = await runner._exec_step(step, sessions, {"RUN_ID": "r1"}, regressions,
+                                     is_teardown=False)
+
+    assert result["status"] == "fail", f"expected fail, got: {result}"
+    assert "cap internal" in result.get("error", ""), (
+        f"inner exception message must appear in error: {result.get('error')!r}"
+    )
+    assert len(regressions) == 1, f"expected one regression, got: {regressions}"
+    assert regressions[0]["class"] == "harness", (
+        f"expected class=harness for capture raise, got: {regressions[0]['class']!r}"
+    )
+
+
+@pytest.mark.anyio
+async def test_replay_multistep_exception_in_step2_produces_per_step_results(monkeypatch, tmp_path):
+    """Regression (#26): the critical mid-run crash scenario.
+
+    3-step suite where step 1 runs fine (pass), step 2's assertion evaluation
+    raises BaseExceptionGroup (simulating the jsonpath internal crash), and step 3
+    runs afterwards.  With Fix 1 in place _exec_step never lets a non-fatal
+    BaseException escape, so:
+      - _replay returns a dict (no raise)
+      - result is NOT 'error' / phase='execution'
+      - steps list has entries for all 3 steps
+      - step 2 has status='fail' with the inner message in error
+      - step 3 ran (has its own status entry, not 'skipped' due to abort)
+
+    This directly reproduces the observed symptom: counts.steps=1, passed=0, failed=0
+    (because remaining steps were discarded when the exception escaped to _replay).
+    """
+    monkeypatch.setenv("MCP_TESTER_ROOT", str(tmp_path))
+    (tmp_path / "mcp-suites").mkdir(exist_ok=True)
+    (tmp_path / "mcp-suites" / "targets.yaml").write_text("{}", encoding="utf-8")
+
+    import mcp_tester_plugin.runner as _runner
+    from mcp_tester_plugin import assertions as _assertions
+
+    # Track how many times _exec_step is called at the real level via assertions.evaluate.
+    call_count = [0]
+    original_evaluate = _assertions.evaluate
+
+    def patched_evaluate(assertion, data):
+        call_count[0] += 1
+        if call_count[0] == 1:
+            # First call (step 2's assertion) raises a BaseExceptionGroup.
+            raise BaseExceptionGroup("mid-run", [RuntimeError("step2 crash")])
+        return original_evaluate(assertion, data)
+
+    monkeypatch.setattr(_assertions, "evaluate", patched_evaluate)
+
+    # Stub _referenced_servers to return [] so no real server init is needed.
+    monkeypatch.setattr(_runner, "_referenced_servers", lambda doc, specs: [])
+
+    # Build a 3-step suite.  All steps target server "s" which won't be initialized
+    # (referenced_servers returns []), so they'd normally be skipped — but we want
+    # to exercise _exec_step for real.  Instead monkeypatch sessions directly by
+    # patching _exec_step to call the real function with a fake sessions dict.
+    fake_session = _FakeSession(result_text='{"ok": true}')
+    fake_sessions = {"s": (fake_session, {"fake_tool"}, "fake-mcp")}
+
+    original_exec_step = _runner._exec_step
+
+    async def patched_exec_step(step, sessions, variables, regressions, *, is_teardown):
+        return await original_exec_step(
+            step, fake_sessions, variables, regressions, is_teardown=is_teardown
+        )
+
+    monkeypatch.setattr(_runner, "_exec_step", patched_exec_step)
+
+    three_step_doc = {
+        "schema": 1,
+        "suite": "test / three-step",
+        "servers": {"s": {"plugin": "fake"}},
+        "steps": [
+            {
+                "id": "step1",
+                "server": "s",
+                "tool": "fake_tool",
+                "args": {},
+            },
+            {
+                "id": "step2",
+                "server": "s",
+                "tool": "fake_tool",
+                "args": {},
+                "expect": [{"path": "$.ok", "op": "equals", "value": True}],
+            },
+            {
+                "id": "step3",
+                "server": "s",
+                "tool": "fake_tool",
+                "args": {},
+            },
+        ],
+    }
+
+    result = await _runner._replay(three_step_doc, tmp_path, {}, "continue")
+
+    # Must return a dict, never raise.
+    assert isinstance(result, dict), f"expected dict, got: {result!r}"
+    # Must NOT be the opaque outer-guard 'error' with phase='execution'.
+    assert result.get("result") != "error" or result.get("phase") != "execution", (
+        f"mid-run crash must not produce outer-guard error/execution report: {result}"
+    )
+    # All 3 steps must have entries (none discarded).
+    steps = result.get("steps", [])
+    assert len(steps) == 3, (
+        f"all 3 steps must appear in results (none discarded), got {len(steps)}: {steps}"
+    )
+    step_by_id = {s["id"]: s for s in steps}
+    # Step 2 must be a per-step fail with the inner message.
+    step2 = step_by_id.get("step2", {})
+    assert step2.get("status") == "fail", (
+        f"step2 must be fail (BaseExceptionGroup caught per-step): {step2}"
+    )
+    assert "step2 crash" in step2.get("error", ""), (
+        f"inner message must appear in step2 error: {step2.get('error')!r}"
+    )
+    # Step 3 must have run (policy=continue; step2 fail is recorded, not an escape).
+    step3 = step_by_id.get("step3", {})
+    assert step3.get("status") is not None, (
+        f"step3 must have run (status must be set): {step3}"
+    )
+    assert step3.get("status") != "skipped" or step3.get("reason") != "aborted by policy", (
+        f"step3 must not be aborted by policy (only fail policy=abort triggers abort): {step3}"
+    )
+
+
+@pytest.mark.anyio
+async def test_exec_step_substitute_value_raises_non_unresolved_survives_as_fail(monkeypatch):
+    """Regression (#26): a RuntimeError (not UnresolvedVariable) raised by
+    assertions.substitute while processing an assertion value must be caught by the
+    broad per-step guard and returned as status='fail' without propagating.
+
+    Before Fix 1, the inner try/except around ``assertions.substitute(a2["value"], ...)``
+    only caught ``UnresolvedVariable``.  Any other exception escaped the assertion
+    loop entirely, hit the outer ``try``'s bare scope (no guard), and propagated out
+    of _exec_step to _replay's handler.
+    """
+    session = _FakeSession(result_text='{"ok": true}')
+    sessions = {"s": (session, {"fake_tool"}, "fake-mcp")}
+    step = {
+        "id": "subst_step",
+        "server": "s",
+        "tool": "fake_tool",
+        "args": {},
+        "expect": [{"path": "$.ok", "op": "equals", "value": "${some_var}"}],
+    }
+    regressions: list[dict[str, Any]] = []
+
+    from mcp_tester_plugin import assertions as _assertions
+
+    original_substitute = _assertions.substitute
+    call_count = [0]
+
+    def patched_substitute(obj, variables):
+        call_count[0] += 1
+        # First call is for step args (an empty dict); let it pass.
+        # Second call is for the assertion value — raise a non-UnresolvedVariable error.
+        if call_count[0] >= 2:
+            raise RuntimeError("substitute internal")
+        return original_substitute(obj, variables)
+
+    monkeypatch.setattr(_assertions, "substitute", patched_substitute)
+
+    result = await runner._exec_step(step, sessions, {"RUN_ID": "r1"}, regressions,
+                                     is_teardown=False)
+
+    assert result["status"] == "fail", f"expected fail, got: {result}"
+    assert "substitute internal" in result.get("error", ""), (
+        f"error message must contain the raise message: {result.get('error')!r}"
+    )
+    # Must not have re-raised — if we reach this line the function returned normally.
