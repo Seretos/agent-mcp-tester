@@ -646,8 +646,14 @@ async def _exec_step(
         out["assertions"] = assertion_results
 
         all_ok = all(a.get("ok") for a in assertion_results)
-        # A tool-level error with no assertion explicitly inspecting it is a failure.
+        # A tool-level error with no assertion explicitly inspecting it is a failure,
+        # UNLESS this is a teardown step and the error text signals "already gone" —
+        # in that case, treat it as a successful/silent skip (idempotent teardown).
         if is_error and not expects:
+            if is_teardown and _is_not_found_error(text):
+                out["status"] = "skipped"
+                out["reason"] = "resource already removed (not-found error ignored in teardown)"
+                return out
             all_ok = False
 
         if not all_ok:
@@ -725,6 +731,20 @@ async def _exec_step(
 # --------------------------------------------------------------------------
 # Helpers
 # --------------------------------------------------------------------------
+
+_NOT_FOUND_PATTERNS = ("not found", "does not exist", "no such")
+
+
+def _is_not_found_error(text: str) -> bool:
+    """Return True if ``text`` signals a "resource already gone" condition.
+
+    Case-insensitive substring match against common "not found" patterns so
+    that teardown steps removing an already-removed resource can be silently
+    skipped rather than emitting a teardown_warning.
+    """
+    lower = text.lower()
+    return any(pat in lower for pat in _NOT_FOUND_PATTERNS)
+
 
 # Pattern: mcp__ followed by one or more non-empty underscore-delimited
 # segments, then a closing __.  Requires at least one segment so that a bare

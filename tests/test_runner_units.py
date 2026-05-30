@@ -2948,3 +2948,178 @@ async def test_exec_step_substitute_value_raises_non_unresolved_survives_as_fail
         f"error message must contain the raise message: {result.get('error')!r}"
     )
     # Must not have re-raised — if we reach this line the function returned normally.
+
+
+# --------------------------------------------------------------------------
+# Ticket #28 — Finding 2: JSONPath index expression against dict returns []
+# (regression tests — must fail on unfixed code, pass after the fix)
+# --------------------------------------------------------------------------
+
+def test_jsonpath_all_index_against_dict_returns_empty():
+    """Regression (#28/F2): ``$[0]`` applied to a dict (not a list) must return []
+    without raising KeyError.  The tool response wraps an array as
+    ``{"result": [...]}`` — applying a root-index path to the dict raised
+    KeyError before the fix."""
+    result = assertions.jsonpath_all("$[0]", {"result": [{"id": 1}]})
+    assert result == [], f"expected [], got: {result!r}"
+
+
+def test_extract_one_index_against_dict_returns_not_found():
+    """Regression (#28/F2): ``extract_one`` delegates to ``jsonpath_all``; a root-index
+    path against a dict must return ``(False, None)`` without raising."""
+    found, value = assertions.extract_one("$[0].id", {"result": [{"id": 1}]})
+    assert found is False
+    assert value is None
+
+
+def test_evaluate_index_against_dict_path_did_not_resolve():
+    """Regression (#28/F2): ``evaluate`` with op='exists' on a root-index path against
+    a dict must return ok=False without raising."""
+    result = assertions.evaluate({"path": "$[0].id", "op": "exists"}, {"result": [{"id": 1}]})
+    assert result["ok"] is False
+
+
+@pytest.mark.anyio
+async def test_exec_step_keyerror_on_index_path_does_not_crash():
+    """Regression (#28/F2): a step with ``expect`` and ``capture`` using a root-index
+    path (``$[0].id``) against a dict-wrapped response must produce status='fail'
+    (structured failure), not an uncaught exception."""
+    session = _FakeSession(result_text='{"result": [{"id": 1, "path": "/tmp/wt"}]}')
+    sessions = {"s": (session, {"create_worktree"}, "fake-mcp")}
+    step = {
+        "id": "create_wt",
+        "server": "s",
+        "tool": "create_worktree",
+        "args": {},
+        "expect": [{"path": "$[0].id", "op": "exists"}],
+        "capture": {"worktree_id": "$[0].id"},
+    }
+    regressions: list[dict[str, Any]] = []
+
+    result = await runner._exec_step(step, sessions, {"RUN_ID": "r1"}, regressions,
+                                     is_teardown=False)
+
+    # Must be a structured fail, not an uncaught exception.
+    assert result["status"] == "fail", f"expected fail (wrong path), got: {result}"
+
+
+@pytest.mark.anyio
+async def test_exec_step_unresolved_capture_from_wrong_path():
+    """Regression (#28/F2): when a capture step fails due to a wrong JSONPath,
+    the step's status is 'fail' with a harness regression mentioning the path."""
+    session = _FakeSession(result_text='{"result": [{"id": 1}]}')
+    sessions = {"s": (session, {"create_worktree"}, "fake-mcp")}
+    # No expect entries so we go straight to capture — the wrong path won't resolve.
+    step = {
+        "id": "cap_step",
+        "server": "s",
+        "tool": "create_worktree",
+        "args": {},
+        "capture": {"worktree_id": "$[0].id"},
+    }
+    regressions: list[dict[str, Any]] = []
+
+    result = await runner._exec_step(step, sessions, {"RUN_ID": "r1"}, regressions,
+                                     is_teardown=False)
+
+    assert result["status"] == "fail", f"expected fail, got: {result}"
+    assert len(regressions) == 1, f"expected one regression, got: {regressions}"
+    # The regression must reference the capture path problem.
+    reg = regressions[0]
+    assert reg["class"] == "harness", f"expected class=harness, got: {reg['class']!r}"
+    assert "$[0].id" in reg.get("observed", "") or "$[0].id" in reg.get("expected", ""), (
+        f"regression must mention the failing path; got: {reg}"
+    )
+
+
+# --------------------------------------------------------------------------
+# Ticket #28 — Finding 2: edge cases for JSONPath evaluation
+# --------------------------------------------------------------------------
+
+def test_jsonpath_all_invalid_path_raises_valueerror():
+    """Invalid path strings must still raise ValueError (parse-error handling intact)."""
+    with pytest.raises(ValueError, match="invalid JSONPath"):
+        assertions.jsonpath_all("$[[[invalid", {"x": 1})
+
+
+def test_jsonpath_all_valid_nested_path_unaffected():
+    """A correctly-rooted nested path must still return the expected value."""
+    result = assertions.jsonpath_all("$.result[0].id", {"result": [{"id": 1}]})
+    assert result == [1], f"expected [1], got: {result!r}"
+
+
+# --------------------------------------------------------------------------
+# Ticket #28 — Finding 3: teardown idempotency for "not found" error responses
+# --------------------------------------------------------------------------
+
+class _FakeErrorSession:
+    """Duck-typed session that always returns an is_error=True result."""
+    def __init__(self, text: str):
+        self._text = text
+
+    async def call_tool(self, tool: str, arguments: dict) -> _FakeCallResult:
+        return _FakeCallResult(text=self._text, is_error=True)
+
+
+def test_is_not_found_error_patterns():
+    """Unit test for _is_not_found_error: matches known patterns case-insensitively."""
+    assert runner._is_not_found_error("worktree not found")
+    assert runner._is_not_found_error("Not Found")
+    assert runner._is_not_found_error("resource does not exist")
+    assert runner._is_not_found_error("no such file or directory")
+    # Must NOT match unrelated errors.
+    assert not runner._is_not_found_error("permission denied")
+    assert not runner._is_not_found_error("internal server error")
+    assert not runner._is_not_found_error("")
+
+
+@pytest.mark.anyio
+async def test_exec_step_teardown_not_found_is_error_no_warning():
+    """Regression (#28/F3): a teardown step that returns is_error=True with a
+    'not found' message must yield status='skipped' with no teardown_note and
+    no regression — idempotent teardown."""
+    session = _FakeErrorSession('{"message": "worktree not found"}')
+    sessions = {"s": (session, {"remove_worktree"}, "fake-mcp")}
+    step = {
+        "id": "teardown_remove",
+        "server": "s",
+        "tool": "remove_worktree",
+        "args": {"id": "wt-123"},
+    }
+    regressions: list[dict[str, Any]] = []
+
+    result = await runner._exec_step(step, sessions, {"RUN_ID": "r1"}, regressions,
+                                     is_teardown=True)
+
+    assert result["status"] == "skipped", (
+        f"expected skipped for not-found teardown error, got: {result}"
+    )
+    assert "teardown_note" not in result, (
+        f"teardown_note must be absent for not-found skip, got: {result.get('teardown_note')!r}"
+    )
+    assert regressions == [], f"expected no regressions, got: {regressions}"
+
+
+@pytest.mark.anyio
+async def test_exec_step_teardown_real_error_still_warns():
+    """Regression (#28/F3): a teardown step with a non-'not-found' error must still
+    produce status='fail' and a teardown_note so it flows into teardown_warnings."""
+    session = _FakeErrorSession('{"message": "permission denied"}')
+    sessions = {"s": (session, {"remove_worktree"}, "fake-mcp")}
+    step = {
+        "id": "teardown_remove",
+        "server": "s",
+        "tool": "remove_worktree",
+        "args": {"id": "wt-123"},
+    }
+    regressions: list[dict[str, Any]] = []
+
+    result = await runner._exec_step(step, sessions, {"RUN_ID": "r1"}, regressions,
+                                     is_teardown=True)
+
+    assert result["status"] == "fail", (
+        f"expected fail for real teardown error, got: {result}"
+    )
+    assert "teardown_note" in result, (
+        f"teardown_note must be present for a real error, got: {result}"
+    )
