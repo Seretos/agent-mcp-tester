@@ -181,9 +181,25 @@ teardown:
     on_missing_var: skip
 ```
 
-The JSONPath in `path` is evaluated against the tool's structured result. Note FastMCP wraps a scalar
-return as `{"result": <value>}`, so a scalar-returning tool asserts on `$.result`; the raw text is always
-available at `$._text`.
+**JSONPath rooting rule — inspect the raw result before writing any `path`.**
+
+Before you write any `expect` or `capture` path, look at the actual JSON object the live tool call
+returned and identify its envelope structure:
+
+- **Nested object envelope** — `{"result": {"id": 1, ...}}` → root all paths at `$.result.*`,
+  e.g. `$.result.id`, `$.result.title`.
+- **Array envelope** — `{"result": [...]}` → use `$.result[0].*` for a specific element, or
+  `$.result[*].*` for list-wide assertions.
+- **Flat top-level fields** — fields at the top level → use `$.<field>` directly,
+  e.g. `$.id`, `$.title`.
+- **Scalar wrap** — `{"result": <scalar>}` (a FastMCP scalar return) → assert on `$.result`.
+  This is a special case of the nested-object rule above.
+
+The raw text representation is always available at `$._text` regardless of envelope shape.
+
+The example above uses the flat-field form (`$.id`, `$.title`). For a FastMCP-wrapped object the
+idiomatic paths are `$.result.id`, `$.result.title`, etc. When in doubt, emit the path you
+*observed* in the actual response — the recorder has the ground truth.
 
 ## What you do NOT do
 

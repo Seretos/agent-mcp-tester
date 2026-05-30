@@ -2382,3 +2382,223 @@ def test_suites_load_malformed_yaml_raises_suite_error(tmp_path):
     assert "invalid YAML" in str(exc_info.value) or "YAML" in str(exc_info.value), (
         f"Error message should mention YAML, got: {exc_info.value!r}"
     )
+
+
+# --------------------------------------------------------------------------
+# Ticket #23: path-resolve failures classified as harness
+# --------------------------------------------------------------------------
+
+@pytest.mark.anyio
+async def test_exec_step_expect_path_miss_classified_harness():
+    """Test A: expect path that does not resolve → class=harness, routing=tool-surface.
+
+    Records a step with expect: [{path: "$.id", ...}] but the session returns
+    {"result": {"id": 42}} — the correct path would be $.result.id. The $.id
+    path does not resolve, so the assertion engine sets error="path did not resolve".
+    All failed assertions have that error, so the regression must be class=harness
+    (suite-authoring defect) not class=behavioural (MCP bug).
+    """
+    session = _FakeSession(result_text='{"result": {"id": 42}}')
+    sessions = {"s": (session, {"create_ticket"}, "fake-mcp")}
+    step = {
+        "id": "create",
+        "server": "s",
+        "tool": "create_ticket",
+        "args": {},
+        "expect": [{"path": "$.id", "op": "equals", "value": 42}],
+    }
+    regressions: list[dict[str, Any]] = []
+
+    result = await runner._exec_step(step, sessions, {"RUN_ID": "r1"}, regressions,
+                                     is_teardown=False)
+
+    assert result["status"] == "fail", f"expected fail, got: {result}"
+    assert len(regressions) == 1, f"expected one regression, got: {regressions}"
+    assert regressions[0]["class"] == "harness", (
+        f"expected class=harness for path-miss, got: {regressions[0]['class']!r}"
+    )
+    assert regressions[0]["routing"] == "tool-surface", (
+        f"expected routing=tool-surface, got: {regressions[0]['routing']!r}"
+    )
+
+
+@pytest.mark.anyio
+async def test_exec_step_capture_path_miss_classified_harness():
+    """Test B: capture path that does not resolve → class=harness, routing=tool-surface.
+
+    Records a step with capture: {wt_id: "$.id"} but the session returns
+    {"result": {"id": 99}} — the correct capture path would be $.result.id.
+    A capture path that does not resolve is always a suite-authoring defect.
+    """
+    session = _FakeSession(result_text='{"result": {"id": 99}}')
+    sessions = {"s": (session, {"create_worktree"}, "fake-mcp")}
+    step = {
+        "id": "create",
+        "server": "s",
+        "tool": "create_worktree",
+        "args": {},
+        "capture": {"wt_id": "$.id"},
+    }
+    regressions: list[dict[str, Any]] = []
+
+    result = await runner._exec_step(step, sessions, {"RUN_ID": "r1"}, regressions,
+                                     is_teardown=False)
+
+    assert result["status"] == "fail", f"expected fail, got: {result}"
+    assert len(regressions) == 1, f"expected one regression, got: {regressions}"
+    assert regressions[0]["class"] == "harness", (
+        f"expected class=harness for capture path-miss, got: {regressions[0]['class']!r}"
+    )
+    assert regressions[0]["routing"] == "tool-surface", (
+        f"expected routing=tool-surface, got: {regressions[0]['routing']!r}"
+    )
+
+
+@pytest.mark.anyio
+async def test_exec_step_mixed_expect_failures_classified_behavioural():
+    """Test C: mixed failures — one path-miss AND one value-wrong → class=behavioural.
+
+    When not ALL failed assertions are path-did-not-resolve, the failure is not
+    purely a suite-authoring defect; at least one assertion resolved correctly but
+    returned the wrong value, so the MCP's behaviour is the likely cause.
+
+    Uses op="equals" on the non-resolving path (not op="exists") because
+    assertions.evaluate for op="exists" returns early WITHOUT setting
+    error="path did not resolve" — so a genuine mixed-failure boundary requires
+    an op that needs the path to resolve (equals, matches, etc.).
+    """
+    # $.result.id resolves to 42; $.missing does not resolve.
+    session = _FakeSession(result_text='{"result": {"id": 42}}')
+    sessions = {"s": (session, {"get_thing"}, "fake-mcp")}
+    step = {
+        "id": "check",
+        "server": "s",
+        "tool": "get_thing",
+        "args": {},
+        "expect": [
+            # This resolves (value is 42) but we assert 999 → value-wrong, no error key.
+            {"path": "$.result.id", "op": "equals", "value": 999},
+            # This does not resolve with op=equals → error="path did not resolve".
+            {"path": "$.missing", "op": "equals", "value": "x"},
+        ],
+    }
+    regressions: list[dict[str, Any]] = []
+
+    result = await runner._exec_step(step, sessions, {"RUN_ID": "r1"}, regressions,
+                                     is_teardown=False)
+
+    assert result["status"] == "fail", f"expected fail, got: {result}"
+    assert len(regressions) == 1, f"expected one regression, got: {regressions}"
+    assert regressions[0]["class"] == "behavioural", (
+        f"expected class=behavioural for mixed failures, got: {regressions[0]['class']!r}"
+    )
+    # Behavioural routing must be distinct from the harness/tool-surface case.
+    assert regressions[0]["routing"] == "behaviour", (
+        f"expected routing=behaviour for behavioural class, got: {regressions[0]['routing']!r}"
+    )
+
+
+@pytest.mark.anyio
+async def test_exec_step_value_wrong_classified_behavioural():
+    """Test D: path resolves but value is wrong → class=behavioural (pure MCP defect).
+
+    $.result.id resolves (value=1), but the suite asserts value=999.
+    No path-miss involved — this is a genuine behavioural regression in the MCP.
+    """
+    session = _FakeSession(result_text='{"result": {"id": 1}}')
+    sessions = {"s": (session, {"get_thing"}, "fake-mcp")}
+    step = {
+        "id": "check",
+        "server": "s",
+        "tool": "get_thing",
+        "args": {},
+        "expect": [{"path": "$.result.id", "op": "equals", "value": 999}],
+    }
+    regressions: list[dict[str, Any]] = []
+
+    result = await runner._exec_step(step, sessions, {"RUN_ID": "r1"}, regressions,
+                                     is_teardown=False)
+
+    assert result["status"] == "fail", f"expected fail, got: {result}"
+    assert len(regressions) == 1, f"expected one regression, got: {regressions}"
+    assert regressions[0]["class"] == "behavioural", (
+        f"expected class=behavioural for value-wrong, got: {regressions[0]['class']!r}"
+    )
+
+
+@pytest.mark.anyio
+async def test_exec_step_multiple_value_wrong_classified_behavioural():
+    """Test E: multiple assertions all resolve but values are wrong → class=behavioural.
+
+    Sanity check that the all-path-miss guard does not fire when none of the
+    assertions have error="path did not resolve" (they all resolved, just wrong values).
+    """
+    session = _FakeSession(result_text='{"result": {"id": 1, "status": "open"}}')
+    sessions = {"s": (session, {"get_thing"}, "fake-mcp")}
+    step = {
+        "id": "check",
+        "server": "s",
+        "tool": "get_thing",
+        "args": {},
+        "expect": [
+            {"path": "$.result.id", "op": "equals", "value": 999},
+            {"path": "$.result.status", "op": "equals", "value": "closed"},
+        ],
+    }
+    regressions: list[dict[str, Any]] = []
+
+    result = await runner._exec_step(step, sessions, {"RUN_ID": "r1"}, regressions,
+                                     is_teardown=False)
+
+    assert result["status"] == "fail", f"expected fail, got: {result}"
+    assert len(regressions) == 1, f"expected one regression, got: {regressions}"
+    assert regressions[0]["class"] == "behavioural", (
+        f"expected class=behavioural for all-value-wrong, got: {regressions[0]['class']!r}"
+    )
+
+
+class _FakeErrorSession:
+    """Duck-typed ClientSession that returns an isError=True result."""
+    def __init__(self, text: str = "tool error occurred"):
+        self._text = text
+        self.called_with: list[tuple[str, dict]] = []
+
+    async def call_tool(self, tool: str, arguments: dict) -> _FakeCallResult:
+        self.called_with.append((tool, arguments))
+        return _FakeCallResult(text=self._text, is_error=True)
+
+
+@pytest.mark.anyio
+async def test_exec_step_is_error_no_expect_classified_behavioural():
+    """Regression (blocking 1): a tool that returns isError=True with NO expect
+    entries must classify as class='behavioural', NOT class='harness'.
+
+    Before the fix, ``all_path_miss = all(... for a in [])`` vacuously returned
+    True when ``failed`` was empty (is_error/no-expect branch sets all_ok=False
+    but never populates assertion_results), so the regression was mislabelled
+    as class='harness' (suite-authoring defect) instead of class='behavioural'
+    (MCP returned an error).
+    """
+    session = _FakeErrorSession(text="internal server error")
+    sessions = {"s": (session, {"do_thing"}, "fake-mcp")}
+    step = {
+        "id": "errstep",
+        "server": "s",
+        "tool": "do_thing",
+        "args": {},
+        # Deliberately NO "expect" entries — the is_error/no-expect branch.
+    }
+    regressions: list[dict[str, Any]] = []
+
+    result = await runner._exec_step(step, sessions, {"RUN_ID": "r1"}, regressions,
+                                     is_teardown=False)
+
+    assert result["status"] == "fail", f"expected fail, got: {result}"
+    assert result.get("is_error") is True, f"expected is_error=True, got: {result}"
+    assert len(regressions) == 1, f"expected one regression, got: {regressions}"
+    assert regressions[0]["class"] == "behavioural", (
+        f"expected class=behavioural for is_error/no-expect, got: {regressions[0]['class']!r}"
+    )
+    assert regressions[0]["routing"] == "behaviour", (
+        f"expected routing=behaviour for behavioural class, got: {regressions[0]['routing']!r}"
+    )
