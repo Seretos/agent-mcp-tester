@@ -1522,3 +1522,510 @@ def test_dataflow_no_warning_for_double_brace_run_id():
     assert not any("run_id" in w for w in warnings), (
         f"Expected no warning for {{{{run_id}}}}, got: {warnings}"
     )
+
+
+# --------------------------------------------------------------------------
+# Ticket #18: ExceptionGroup / BaseExceptionGroup from anyio TaskGroup must
+# not crash _replay — it must return a structured report instead.
+# --------------------------------------------------------------------------
+
+# A minimal suite doc whose server init we will monkeypatch to raise.
+_EG_SUITE_DOC: dict[str, Any] = {
+    "schema": 1,
+    "suite": "test / eg-crash",
+    "servers": {"s": {"plugin": "fake"}},
+    "steps": [
+        {"id": "step1", "server": "s", "tool": "fake_tool"},
+    ],
+}
+
+
+@pytest.mark.anyio
+async def test_replay_exception_group_returns_structured_report(monkeypatch, tmp_path):
+    """Regression (#18): ExceptionGroup raised during server init must be caught
+    and returned as a structured report with result='error', init_ok=False,
+    and the inner exception's message visible in entry['error'].
+
+    Fails on unfixed code (ExceptionGroup escapes the `except Exception` guard
+    and propagates out of _replay). Passes after Fix 1.
+    """
+    monkeypatch.setenv("MCP_TESTER_ROOT", str(tmp_path))
+    sdir = tmp_path / "mcp-suites"
+    sdir.mkdir(exist_ok=True)
+    (sdir / "targets.yaml").write_text("{}", encoding="utf-8")
+
+    import mcp_tester_plugin.runner as _runner
+    from mcp_tester_plugin import resolve as _resolve
+
+    # Patch resolve.resolve to return a minimal launch object so the per-server
+    # loop reaches stdio_client rather than failing at resolution.
+    class _FakeLaunch:
+        source = "override"
+        server = "fake-server"
+        command = "fake-cmd"
+        args: list = []
+
+    monkeypatch.setattr(_resolve, "resolve", lambda *a, **kw: _FakeLaunch())
+
+    # Patch stdio_client to raise ExceptionGroup during server init.
+    from contextlib import asynccontextmanager
+
+    @asynccontextmanager
+    async def boom_stdio_client(_params):
+        raise ExceptionGroup("boom", [RuntimeError("inner-eg")])
+        yield  # pragma: no cover
+
+    monkeypatch.setattr(_runner, "stdio_client", boom_stdio_client)
+
+    result = await _runner._replay(_EG_SUITE_DOC, tmp_path, {}, "continue")
+
+    assert isinstance(result, dict), f"expected dict, got {type(result)}: {result!r}"
+    assert result.get("run_id") is not None, "run_id must be set"
+    assert result.get("result") == "error", f"expected result='error', got: {result.get('result')!r}"
+    assert result.get("servers"), "servers list must be non-empty"
+    server_entry = result["servers"][0]
+    assert server_entry.get("init_ok") is False, f"init_ok must be False: {server_entry}"
+    assert "inner-eg" in server_entry.get("error", ""), (
+        f"inner exception message must appear in error: {server_entry.get('error')!r}"
+    )
+    # Steps are still attempted but skipped (server not initialized); the list is non-None.
+    assert isinstance(result.get("steps"), list), (
+        f"steps must be a list: {result.get('steps')!r}"
+    )
+
+
+@pytest.mark.anyio
+async def test_replay_base_exception_group_returns_structured_report(monkeypatch, tmp_path):
+    """Regression (#18): BaseExceptionGroup (the base spelling) must also be caught
+    and surfaced as a structured report. Ensures both ExceptionGroup and its base
+    class are handled by Fix 1.
+    """
+    monkeypatch.setenv("MCP_TESTER_ROOT", str(tmp_path))
+    sdir = tmp_path / "mcp-suites"
+    sdir.mkdir(exist_ok=True)
+    (sdir / "targets.yaml").write_text("{}", encoding="utf-8")
+
+    import mcp_tester_plugin.runner as _runner
+    from mcp_tester_plugin import resolve as _resolve
+
+    class _FakeLaunch:
+        source = "override"
+        server = "fake-server"
+        command = "fake-cmd"
+        args: list = []
+
+    monkeypatch.setattr(_resolve, "resolve", lambda *a, **kw: _FakeLaunch())
+
+    from contextlib import asynccontextmanager
+
+    @asynccontextmanager
+    async def boom_stdio_client(_params):
+        raise BaseExceptionGroup("boom-base", [ValueError("base-inner")])
+        yield  # pragma: no cover
+
+    monkeypatch.setattr(_runner, "stdio_client", boom_stdio_client)
+
+    result = await _runner._replay(_EG_SUITE_DOC, tmp_path, {}, "continue")
+
+    assert result.get("result") == "error"
+    server_entry = result["servers"][0]
+    assert server_entry.get("init_ok") is False
+    assert "base-inner" in server_entry.get("error", ""), (
+        f"inner exception must appear in error: {server_entry.get('error')!r}"
+    )
+
+
+@pytest.mark.anyio
+async def test_replay_outer_exception_group_returns_structured_report(monkeypatch, tmp_path):
+    """Regression (#18): ExceptionGroup escaping the per-server guard (e.g. raised
+    during step execution or TaskGroup teardown) must be caught by the outer
+    try/except BaseException around AsyncExitStack and returned as a structured
+    report with result='error' and a 'phase' key.
+
+    Exercises Fix 2's outer guard by monkeypatching _exec_step to raise.
+    """
+    monkeypatch.setenv("MCP_TESTER_ROOT", str(tmp_path))
+    (tmp_path / "mcp-suites").mkdir(exist_ok=True)
+    (tmp_path / "mcp-suites" / "targets.yaml").write_text("{}", encoding="utf-8")
+
+    import mcp_tester_plugin.runner as _runner
+
+    # Patch _replay's inner dependencies: stub _referenced_servers to return []
+    # so the per-server loop is skipped (no real stdio_client needed), then
+    # patch _exec_step to raise ExceptionGroup during step execution.
+    monkeypatch.setattr(_runner, "_referenced_servers", lambda doc, specs: [])
+
+    async def boom_exec_step(*_args, **_kwargs):
+        raise ExceptionGroup("step-boom", [OSError("step-inner")])
+
+    monkeypatch.setattr(_runner, "_exec_step", boom_exec_step)
+
+    result = await _runner._replay(_EG_SUITE_DOC, tmp_path, {}, "continue")
+
+    assert isinstance(result, dict), f"expected dict, got: {result!r}"
+    assert result.get("result") == "error", f"expected result='error', got: {result.get('result')!r}"
+    assert "phase" in result, f"outer guard must include 'phase' key: {result}"
+    assert "step-inner" in result.get("error", ""), (
+        f"inner exception must appear in error: {result.get('error')!r}"
+    )
+
+
+@pytest.mark.anyio
+async def test_validate_suite_async_exception_group_does_not_reraise(monkeypatch, tmp_path):
+    """Regression (#18): if _replay raises ExceptionGroup inside validate_suite_async,
+    the exception must not propagate — _replay's outer guard catches it and returns
+    a structured report, so validate_suite_async gets a dict back with result='error'
+    under the 'verify_replay' key.
+
+    This pins the contract: validate_suite_async must always return a dict, never raise
+    BaseExceptionGroup from a verify-replay run.
+    """
+    monkeypatch.setenv("MCP_TESTER_ROOT", str(tmp_path))
+
+    import mcp_tester_plugin.runner as _runner
+
+    # Patch _replay itself to raise ExceptionGroup (simulating the unfixed path).
+    async def replay_raises(*_args, **_kwargs):
+        raise ExceptionGroup("crash", [RuntimeError("inner-validate")])
+
+    monkeypatch.setattr(_runner, "_replay", replay_raises)
+
+    # Write a valid suite file so the file-path branch is taken.
+    _make_suite_file(tmp_path)
+
+    result = await _runner.validate_suite_async("test__minimal", verify_replay=True)
+
+    # Must return a dict, not raise.
+    assert isinstance(result, dict), f"expected dict, got: {result!r}"
+    # The verify_replay sub-dict must reflect the error.
+    assert "verify_replay" in result, f"verify_replay key missing: {result}"
+    assert result["verify_replay"].get("result") == "error", (
+        f"verify_replay result must be 'error', got: {result['verify_replay'].get('result')!r}"
+    )
+
+
+@pytest.mark.anyio
+async def test_server_validate_suite_exception_group_returns_dict(monkeypatch, tmp_path):
+    """Regression (#18 / #19): BaseException raised from runner.validate_suite_async
+    must be caught by server.validate_suite and returned as a structured dict with
+    valid=False and an error key, not propagated as an unhandled crash.
+
+    Exercises Fix 3 in server.py.
+    """
+    monkeypatch.setenv("MCP_TESTER_ROOT", str(tmp_path))
+
+    from mcp_tester_plugin import runner as _runner
+    from mcp_tester_plugin import server
+
+    async def boom_validate(*_args, **_kwargs):
+        raise BaseException("taskgroup crash")
+
+    monkeypatch.setattr(_runner, "validate_suite_async", boom_validate)
+
+    result = await server.validate_suite("any-suite", verify_replay=True)
+
+    assert isinstance(result, dict), f"expected dict, got: {type(result)}: {result!r}"
+    assert result.get("valid") is False, f"valid must be False on crash: {result}"
+    assert "error" in result, f"error key must be present: {result}"
+    assert "taskgroup crash" in result.get("error", ""), (
+        f"error message must include original message: {result.get('error')!r}"
+    )
+
+
+@pytest.mark.anyio
+async def test_server_run_suite_exception_group_caught(monkeypatch):
+    """Regression (#18): ExceptionGroup raised from runner.run_async must be caught
+    by server.run_suite (Fix 4) and returned as a structured dict with result='error'.
+
+    Complements the existing RuntimeError test; specifically exercises the
+    BaseExceptionGroup branch of the widened except clause.
+    """
+    from mcp_tester_plugin import runner as _runner
+    from mcp_tester_plugin import server
+
+    async def boom(suite, *, policy, **kwargs):
+        raise ExceptionGroup("eg", [RuntimeError("eg-inner")])
+
+    monkeypatch.setattr(_runner, "run_async", boom)
+
+    result = await server.run_suite("test__minimal", policy="continue")
+
+    assert isinstance(result, dict), f"expected dict, got: {result!r}"
+    assert result.get("result") == "error", f"expected result='error': {result}"
+    assert "eg-inner" in result.get("error", ""), (
+        f"inner exception message must appear in error: {result.get('error')!r}"
+    )
+
+
+# --------------------------------------------------------------------------
+# Ticket #18 review: CancelledError (and KeyboardInterrupt) must PROPAGATE,
+# never be swallowed into a structured-error dict.
+# --------------------------------------------------------------------------
+
+@pytest.mark.anyio
+async def test_replay_per_server_init_cancelled_error_propagates(monkeypatch, tmp_path):
+    """CancelledError raised by stdio_client during per-server init must propagate
+    out of _replay unchanged — NOT be swallowed into a structured error dict.
+
+    Regression guard for the per-server init guard (catch site 1 in _replay).
+    """
+    import asyncio
+
+    monkeypatch.setenv("MCP_TESTER_ROOT", str(tmp_path))
+    (tmp_path / "mcp-suites").mkdir(exist_ok=True)
+    (tmp_path / "mcp-suites" / "targets.yaml").write_text("{}", encoding="utf-8")
+
+    import mcp_tester_plugin.runner as _runner
+    from mcp_tester_plugin import resolve as _resolve
+
+    class _FakeLaunch:
+        source = "override"
+        server = "fake-server"
+        command = "fake-cmd"
+        args: list = []
+
+    monkeypatch.setattr(_resolve, "resolve", lambda *a, **kw: _FakeLaunch())
+
+    from contextlib import asynccontextmanager
+
+    @asynccontextmanager
+    async def cancelled_stdio_client(_params):
+        raise asyncio.CancelledError()
+        yield  # pragma: no cover
+
+    monkeypatch.setattr(_runner, "stdio_client", cancelled_stdio_client)
+
+    with pytest.raises(asyncio.CancelledError):
+        await _runner._replay(_EG_SUITE_DOC, tmp_path, {}, "continue")
+
+
+@pytest.mark.anyio
+async def test_replay_outer_guard_cancelled_error_propagates(monkeypatch, tmp_path):
+    """CancelledError raised during step execution must propagate out of _replay
+    (through the outer AsyncExitStack guard — catch site 2 in _replay).
+
+    Uses the same monkeypatch idiom as test_replay_outer_exception_group_returns_structured_report
+    but asserts the inverse: the fatal signal must escape, not be structured.
+    """
+    import asyncio
+
+    monkeypatch.setenv("MCP_TESTER_ROOT", str(tmp_path))
+    (tmp_path / "mcp-suites").mkdir(exist_ok=True)
+    (tmp_path / "mcp-suites" / "targets.yaml").write_text("{}", encoding="utf-8")
+
+    import mcp_tester_plugin.runner as _runner
+
+    monkeypatch.setattr(_runner, "_referenced_servers", lambda doc, specs: [])
+
+    async def cancelled_exec_step(*_args, **_kwargs):
+        raise asyncio.CancelledError()
+
+    monkeypatch.setattr(_runner, "_exec_step", cancelled_exec_step)
+
+    with pytest.raises(asyncio.CancelledError):
+        await _runner._replay(_EG_SUITE_DOC, tmp_path, {}, "continue")
+
+
+@pytest.mark.anyio
+async def test_validate_suite_async_cancelled_error_propagates(monkeypatch, tmp_path):
+    """CancelledError raised by _replay inside validate_suite_async must propagate
+    out (catch site 3 — the belt-and-suspenders guard around await _replay).
+
+    The belt-and-suspenders try/except must NOT swallow cancellation.
+    """
+    import asyncio
+
+    monkeypatch.setenv("MCP_TESTER_ROOT", str(tmp_path))
+    _make_suite_file(tmp_path)
+
+    import mcp_tester_plugin.runner as _runner
+
+    async def replay_cancelled(*_args, **_kwargs):
+        raise asyncio.CancelledError()
+
+    monkeypatch.setattr(_runner, "_replay", replay_cancelled)
+
+    with pytest.raises(asyncio.CancelledError):
+        await _runner.validate_suite_async("test__minimal", verify_replay=True)
+
+
+@pytest.mark.anyio
+async def test_server_run_suite_cancelled_error_propagates(monkeypatch):
+    """CancelledError raised by runner.run_async must propagate out of server.run_suite
+    (catch site 4 in server.py) — NOT be returned as an error dict.
+    """
+    import asyncio
+
+    from mcp_tester_plugin import runner as _runner
+    from mcp_tester_plugin import server
+
+    async def boom(suite, *, policy, **kwargs):
+        raise asyncio.CancelledError()
+
+    monkeypatch.setattr(_runner, "run_async", boom)
+
+    with pytest.raises(asyncio.CancelledError):
+        await server.run_suite("test__minimal", policy="continue")
+
+
+@pytest.mark.anyio
+async def test_server_validate_suite_cancelled_error_propagates(monkeypatch, tmp_path):
+    """CancelledError raised by runner.validate_suite_async must propagate out of
+    server.validate_suite (catch site 5 in server.py) — NOT be returned as
+    a structured dict with valid=False.
+    """
+    import asyncio
+
+    monkeypatch.setenv("MCP_TESTER_ROOT", str(tmp_path))
+
+    from mcp_tester_plugin import runner as _runner
+    from mcp_tester_plugin import server
+
+    async def boom(*_args, **_kwargs):
+        raise asyncio.CancelledError()
+
+    monkeypatch.setattr(_runner, "validate_suite_async", boom)
+
+    with pytest.raises(asyncio.CancelledError):
+        await server.validate_suite("any-suite", verify_replay=True)
+
+
+@pytest.mark.anyio
+async def test_replay_per_server_init_keyboard_interrupt_propagates(monkeypatch, tmp_path):
+    """KeyboardInterrupt raised during per-server init must also propagate (not be
+    swallowed). Covers the KeyboardInterrupt branch of _reraise_if_fatal.
+    """
+    monkeypatch.setenv("MCP_TESTER_ROOT", str(tmp_path))
+    (tmp_path / "mcp-suites").mkdir(exist_ok=True)
+    (tmp_path / "mcp-suites" / "targets.yaml").write_text("{}", encoding="utf-8")
+
+    import mcp_tester_plugin.runner as _runner
+    from mcp_tester_plugin import resolve as _resolve
+
+    class _FakeLaunch:
+        source = "override"
+        server = "fake-server"
+        command = "fake-cmd"
+        args: list = []
+
+    monkeypatch.setattr(_resolve, "resolve", lambda *a, **kw: _FakeLaunch())
+
+    from contextlib import asynccontextmanager
+
+    @asynccontextmanager
+    async def ki_stdio_client(_params):
+        raise KeyboardInterrupt()
+        yield  # pragma: no cover
+
+    monkeypatch.setattr(_runner, "stdio_client", ki_stdio_client)
+
+    with pytest.raises(KeyboardInterrupt):
+        await _runner._replay(_EG_SUITE_DOC, tmp_path, {}, "continue")
+
+
+# --------------------------------------------------------------------------
+# Ticket #18 targeted fix: BaseExceptionGroup wrapping CancelledError must
+# propagate — not be swallowed into a structured-error dict.
+# anyio delivers cancellation during TaskGroup/AsyncExitStack teardown as
+# BaseExceptionGroup("...", [CancelledError()]), whose top-level type is NOT
+# CancelledError. The fixed _reraise_if_fatal now recurses into the group.
+# --------------------------------------------------------------------------
+
+@pytest.mark.anyio
+async def test_replay_per_server_init_cancelled_group_propagates(monkeypatch, tmp_path):
+    """BaseExceptionGroup wrapping CancelledError raised during per-server init
+    must propagate out of _replay — NOT be swallowed into a structured error dict.
+
+    Regression guard for the anyio TaskGroup cancellation path: anyio wraps
+    CancelledError in a BaseExceptionGroup during teardown. The unfixed
+    _reraise_if_fatal only checks isinstance(exc, CancelledError), so the group
+    slips past and gets returned as result='error'. The fix recurses into the group.
+    """
+    import asyncio
+
+    monkeypatch.setenv("MCP_TESTER_ROOT", str(tmp_path))
+    (tmp_path / "mcp-suites").mkdir(exist_ok=True)
+    (tmp_path / "mcp-suites" / "targets.yaml").write_text("{}", encoding="utf-8")
+
+    import mcp_tester_plugin.runner as _runner
+    from mcp_tester_plugin import resolve as _resolve
+
+    class _FakeLaunch:
+        source = "override"
+        server = "fake-server"
+        command = "fake-cmd"
+        args: list = []
+
+    monkeypatch.setattr(_resolve, "resolve", lambda *a, **kw: _FakeLaunch())
+
+    from contextlib import asynccontextmanager
+
+    @asynccontextmanager
+    async def cancelled_group_stdio_client(_params):
+        raise BaseExceptionGroup("tg", [asyncio.CancelledError()])
+        yield  # pragma: no cover
+
+    monkeypatch.setattr(_runner, "stdio_client", cancelled_group_stdio_client)
+
+    # Must propagate the group (or the inner CancelledError), never return a dict.
+    with pytest.raises(BaseExceptionGroup):
+        await _runner._replay(_EG_SUITE_DOC, tmp_path, {}, "continue")
+
+
+@pytest.mark.anyio
+async def test_replay_outer_guard_cancelled_group_propagates(monkeypatch, tmp_path):
+    """BaseExceptionGroup wrapping CancelledError raised during step execution
+    must propagate out of _replay's outer AsyncExitStack guard — NOT be
+    returned as a structured error dict with result='error'.
+
+    Exercises the outer except BaseException guard (catch site 2 in _replay)
+    with the anyio cancellation group shape.
+    """
+    import asyncio
+
+    monkeypatch.setenv("MCP_TESTER_ROOT", str(tmp_path))
+    (tmp_path / "mcp-suites").mkdir(exist_ok=True)
+    (tmp_path / "mcp-suites" / "targets.yaml").write_text("{}", encoding="utf-8")
+
+    import mcp_tester_plugin.runner as _runner
+
+    monkeypatch.setattr(_runner, "_referenced_servers", lambda doc, specs: [])
+
+    async def cancelled_group_exec_step(*_args, **_kwargs):
+        raise BaseExceptionGroup("tg", [asyncio.CancelledError()])
+
+    monkeypatch.setattr(_runner, "_exec_step", cancelled_group_exec_step)
+
+    # Must propagate the group, never return a structured dict.
+    with pytest.raises(BaseExceptionGroup):
+        await _runner._replay(_EG_SUITE_DOC, tmp_path, {}, "continue")
+
+
+@pytest.mark.anyio
+async def test_replay_nested_cancelled_group_propagates(monkeypatch, tmp_path):
+    """Nested BaseExceptionGroup (group-of-groups) containing CancelledError must
+    also propagate — _contains_fatal recurses into nested groups.
+
+    Covers the recursive case: BaseExceptionGroup("outer", [
+        BaseExceptionGroup("inner", [CancelledError()])
+    ]).
+    """
+    import asyncio
+
+    monkeypatch.setenv("MCP_TESTER_ROOT", str(tmp_path))
+    (tmp_path / "mcp-suites").mkdir(exist_ok=True)
+    (tmp_path / "mcp-suites" / "targets.yaml").write_text("{}", encoding="utf-8")
+
+    import mcp_tester_plugin.runner as _runner
+
+    monkeypatch.setattr(_runner, "_referenced_servers", lambda doc, specs: [])
+
+    async def nested_cancelled_group_exec_step(*_args, **_kwargs):
+        inner = BaseExceptionGroup("inner", [asyncio.CancelledError()])
+        raise BaseExceptionGroup("outer", [inner])
+
+    monkeypatch.setattr(_runner, "_exec_step", nested_cancelled_group_exec_step)
+
+    # The nested group must propagate, not be swallowed.
+    with pytest.raises(BaseExceptionGroup):
+        await _runner._replay(_EG_SUITE_DOC, tmp_path, {}, "continue")

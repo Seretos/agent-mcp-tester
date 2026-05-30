@@ -16,6 +16,8 @@ from typing import Any
 
 from mcp.server.fastmcp import FastMCP
 
+from .runner import _format_exc, _reraise_if_fatal
+
 mcp = FastMCP("mcp-tester")
 
 
@@ -43,10 +45,12 @@ async def run_suite(suite: str, policy: str = "continue") -> dict:
 
     try:
         return await runner.run_async(suite, policy=policy)
-    except Exception as exc:  # noqa: BLE001
+    except BaseException as exc:  # noqa: BLE001
+        _reraise_if_fatal(exc)
+        err_msg = _format_exc(exc)
         return {
             "result": "error",
-            "error": f"{type(exc).__name__}: {exc}",
+            "error": err_msg,
             "suite": suite,
             "run_id": None,
             "counts": {},
@@ -85,8 +89,20 @@ async def validate_suite(suite: str, verify_replay: bool = True) -> dict:
     contains the replay report; replay pass/fail does NOT affect `valid`.
     """
     from . import runner
+    from . import suites
 
-    return await runner.validate_suite_async(suite, verify_replay=verify_replay)
+    try:
+        return await runner.validate_suite_async(suite, verify_replay=verify_replay)
+    except suites.SuiteError:
+        raise
+    except BaseException as exc:  # noqa: BLE001
+        _reraise_if_fatal(exc)
+        err_msg = _format_exc(exc)
+        return {
+            "valid": False,
+            "error": err_msg,
+            "verify_replay": {"result": "error", "error": err_msg},
+        }
 
 
 @mcp.tool()
