@@ -46,7 +46,7 @@ async def run_suite(suite: str, policy: str = "continue") -> dict:
     except Exception as exc:  # noqa: BLE001
         return {
             "result": "error",
-            "error": f"{type(exc).__name__}: {exc}",
+            "error": runner._unwrap_exception(exc),
             "suite": suite,
             "run_id": None,
             "counts": {},
@@ -84,9 +84,27 @@ async def validate_suite(suite: str, verify_replay: bool = True) -> dict:
     file is written. When `verify_replay` is True, a `verify_replay` key
     contains the replay report; replay pass/fail does NOT affect `valid`.
     """
-    from . import runner
+    from . import runner, suites
 
-    return await runner.validate_suite_async(suite, verify_replay=verify_replay)
+    try:
+        return await runner.validate_suite_async(suite, verify_replay=verify_replay)
+    except suites.SuiteError as exc:
+        # Schema/structure validation failed — valid=False is correct here.
+        return {
+            "valid": False,
+            "error": str(exc),
+            "suite": suite,
+        }
+    except Exception as exc:  # noqa: BLE001
+        # Runtime crash (e.g. ExceptionGroup from _replay, OS error, etc.)
+        # that occurred AFTER schema validation passed.  The suite is
+        # schema-valid; only the replay crashed.  Preserve valid=True per the
+        # documented contract ("valid reflects schema validity only").
+        return {
+            "valid": True,
+            "error": runner._unwrap_exception(exc),
+            "suite": suite,
+        }
 
 
 @mcp.tool()
