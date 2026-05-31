@@ -199,8 +199,9 @@ jobs:
           # Copy the install-ready, non-binary parts from the stamped tree.
           cp -a stamped/.claude-plugin "$STAGE/"
           [ -d stamped/.codex-plugin ] && cp -a stamped/.codex-plugin "$STAGE/" || true
-          [ -f stamped/README.md ] && cp -a stamped/README.md "$STAGE/" || true
-          [ -f stamped/LICENSE   ] && cp -a stamped/LICENSE   "$STAGE/" || true
+          [ -f stamped/README.md      ] && cp -a stamped/README.md      "$STAGE/" || true
+          [ -f stamped/LICENSE        ] && cp -a stamped/LICENSE        "$STAGE/" || true
+          [ -f stamped/description.md ] && cp -a stamped/description.md "$STAGE/" || true
           # This plugin ships skills/ AND agents/ alongside the binary.
           if [ -d stamped/skills ]; then
             cp -a stamped/skills "$STAGE/"
@@ -341,7 +342,8 @@ jobs:
           # read no longer exists here (wiped by the orphan-branch git clean).
           DESC:    ${{ needs.stamp.outputs.description }}
           REPO:    ${{ github.repository }}
-          ICON:    "https://raw.githubusercontent.com/${{ github.repository }}/${{ needs.stamp.outputs.tag }}/assets/icon.png"
+          ICON:             "https://raw.githubusercontent.com/${{ github.repository }}/${{ needs.stamp.outputs.tag }}/assets/icon.png"
+          DESCRIPTION_URL: "https://raw.githubusercontent.com/${{ github.repository }}/${{ needs.stamp.outputs.tag }}/description.md"
         run: |
           # Build the payload with jq so name/description are correctly JSON-escaped.
           PAYLOAD=$(jq -n \
@@ -349,17 +351,19 @@ jobs:
             --arg description "$DESC" \
             --arg repo        "$REPO" \
             --arg version     "$VERSION" \
-            --arg ref         "$TAG" \
-            --arg icon        "$ICON" \
+            --arg ref             "$TAG" \
+            --arg icon            "$ICON" \
+            --arg description_url "$DESCRIPTION_URL" \
             '{event_type: "plugin-release",
               client_payload: {
-                name:        $name,
-                description: $description,
-                repo:        $repo,
-                category:    "mcp",
-                version:     $version,
-                ref:         $ref,
-                icon:        $icon
+                name:            $name,
+                description:     $description,
+                repo:            $repo,
+                category:        "mcp",
+                version:         $version,
+                ref:             $ref,
+                icon:            $icon,
+                description_url: $description_url
               }}')
           curl -fsSL -X POST \
             -H "Authorization: Bearer $GH_PAT" \
