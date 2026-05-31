@@ -363,7 +363,8 @@ jobs:
                 version:         $version,
                 ref:             $ref,
                 icon:            $icon,
-                description_url: $description_url
+                description_url: $description_url,
+                tags:            ["e2e-test","replay"]
               }}')
           curl -fsSL -X POST \
             -H "Authorization: Bearer $GH_PAT" \

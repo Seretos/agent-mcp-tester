@@ -78,7 +78,8 @@ jobs:
               "version":     "${VERSION}",
               "ref":             "${TAG}",
               "icon":            "https://raw.githubusercontent.com/${REPO}/${TAG}/assets/icon.png",
-              "description_url": "https://raw.githubusercontent.com/${REPO}/${TAG}/description.md"
+              "description_url": "https://raw.githubusercontent.com/${REPO}/${TAG}/description.md",
+              "tags":            ["e2e-test","replay"]
             }
           }
           EOF
