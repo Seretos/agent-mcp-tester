@@ -191,6 +191,84 @@ def test_validate_rejects_near_miss_assertion_key_assert():
     assert "expect" in str(exc_info.value)
 
 
+def test_validate_malformed_assertion_message_includes_shape():
+    """Assertion dict missing 'op' must produce an error that names both 'path'
+    and 'op' and includes at least one known op name (e.g. 'exists')."""
+    bad = {
+        **GOOD_SUITE,
+        "steps": [
+            {
+                "id": "x",
+                "server": "pi",
+                "tool": "t",
+                "expect": [{"path": "$.id"}],  # missing 'op'
+            }
+        ],
+    }
+    with pytest.raises(suites.SuiteError) as exc_info:
+        suites.validate(bad)
+    msg = str(exc_info.value)
+    assert "path" in msg, f"Expected 'path' in error message, got: {msg!r}"
+    assert "op" in msg, f"Expected 'op' in error message, got: {msg!r}"
+    assert "exists" in msg, f"Expected an op name like 'exists' in error message, got: {msg!r}"
+
+
+def test_validate_malformed_assertion_non_dict_includes_shape():
+    """A scalar assertion entry (e.g. the string 'exists') must produce an error
+    that includes both 'path' and 'op' from the canonical shape hint."""
+    bad = {
+        **GOOD_SUITE,
+        "steps": [
+            {
+                "id": "x",
+                "server": "pi",
+                "tool": "t",
+                "expect": ["exists"],  # scalar, not a dict
+            }
+        ],
+    }
+    with pytest.raises(suites.SuiteError) as exc_info:
+        suites.validate(bad)
+    msg = str(exc_info.value)
+    assert "path" in msg, f"Expected 'path' in error message, got: {msg!r}"
+    assert "op" in msg, f"Expected 'op' in error message, got: {msg!r}"
+
+
+@pytest.mark.parametrize(
+    "assertion",
+    [
+        {"path": "$.id", "equals": "hello"},
+        {"path": "$.id", "contains": "x"},
+        {"path": "$.id", "expect": "exists"},
+        {"path": "$.id", "value": "x"},
+        {"path": "$.id", "matches": "^foo"},
+        {"path": "$.id", "type": "string"},
+    ],
+)
+def test_validate_malformed_assertion_near_miss_op_key(assertion):
+    """An assertion dict that has a recognised near-miss key (e.g. 'equals',
+    'contains', 'expect', 'value', 'matches', 'type') but is missing 'op'
+    must produce an error containing \"op:\" (the near-miss hint)."""
+    bad = {
+        **GOOD_SUITE,
+        "steps": [
+            {
+                "id": "x",
+                "server": "pi",
+                "tool": "t",
+                "expect": [assertion],
+            }
+        ],
+    }
+    with pytest.raises(suites.SuiteError) as exc_info:
+        suites.validate(bad)
+    msg = str(exc_info.value)
+    assert "op:" in msg, (
+        f"Expected near-miss hint \"op:\" in error message for assertion {assertion!r}, "
+        f"got: {msg!r}"
+    )
+
+
 def test_default_filename():
     assert (
         suites.default_filename(GOOD_SUITE)
