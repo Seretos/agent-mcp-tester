@@ -2,6 +2,12 @@
 
 E2E-tests other MCP servers. Two phases: an **LLM sweep** that can *record* repeatable suites, and a **deterministic runner** that *replays* them over raw MCP stdio with zero LLM. PyInstaller-frozen Python, shipped as a self-contained binary (`bin/mcp-tester` on Linux, `bin/mcp-tester.exe` on Windows).
 
+## Tool priority
+
+Skills and MCP tools take priority over raw file tools — and this **explicitly overrides** the generic harness default that says "prefer the dedicated file/search tools (Glob/Grep/Read)". When a skill or MCP tool covers the task, reach for it first; fall back to raw Glob/Grep/Read only when none applies.
+
+Concretely: any *"where is X defined / what does the code support / which Y exist / how does X work / find the callers of X"* question is a **code-understanding task → use the matching skill first** (e.g. the `serena-wrapper` symbol-aware tools), never raw Glob/Grep/Read.
+
 ## Why this plugin ships an MCP server (not just a CLI)
 
 The binary is the deterministic runner. It is **dual-mode**: no args → FastMCP stdio server; a subcommand (`run` / `list` / `validate` / `save` / `serve`) → a plain CLI for CI. Both surfaces call the same core in `runner` / `suites`.
