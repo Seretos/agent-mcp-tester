@@ -19,6 +19,17 @@ import yaml
 from .assertions import ASSERTION_OPS, find_references
 
 SCHEMA_VERSION = 1
+
+# Canonical assertion shape hint — computed once, stays in sync with ASSERTION_OPS.
+_SORTED_OPS = "|".join(sorted(ASSERTION_OPS))
+_ASSERTION_SHAPE_HINT = (
+    "expected { path: <jsonpath>, op: "
+    + _SORTED_OPS
+    + ", value: <v for comparison ops> }"
+)
+# Keys that look like a miskeyed "op:" slot in an assertion dict.
+_ASSERTION_NEAR_MISS_KEYS = {"expect", "equals", "value", "contains", "matches", "type"}
+
 SUITES_DIRNAME = "mcp-suites"
 TARGETS_FILENAME = "targets.yaml"
 
@@ -245,7 +256,16 @@ def _validate_step(
         raise SuiteError(f"step {sid!r} references unknown server {srv!r}")
     for a in step.get("expect", []) or []:
         if not isinstance(a, dict) or "path" not in a or "op" not in a:
-            raise SuiteError(f"step {sid!r} has a malformed assertion: {a!r}")
+            hint = ""
+            if isinstance(a, dict):
+                bad_keys = set(a.keys()) & _ASSERTION_NEAR_MISS_KEYS
+                if bad_keys:
+                    bad_key = next(iter(sorted(bad_keys)))
+                    hint = f"; did you mean 'op:'? (found key {bad_key!r})"
+            raise SuiteError(
+                f"step {sid!r} has a malformed assertion: {a!r}{hint} — "
+                + _ASSERTION_SHAPE_HINT
+            )
         if a["op"] not in ASSERTION_OPS:
             raise SuiteError(
                 f"step {sid!r} uses unknown op {a['op']!r}; "
